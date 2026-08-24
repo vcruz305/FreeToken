@@ -11,12 +11,16 @@
 </p>
 
 
-> ### This fork: GGUF support for the Qwen3.5 and Qwen3.6 families, and for every ggml quant type
+> ### This fork: multi-shard GGUF, the Qwen3 / Qwen3.5 / Qwen3.6 families, and every ggml quant type
 >
-> Upstream FreeToken reads GGUF for Gemma-4 only, and only Q4_0, Q8_0 and Q6_K. Everything
-> else has to be a safetensors checkpoint. This fork widens both halves of that: any ggml
-> quant type the vendored kernels already handle, and the `qwen35moe` and `qwen35`
-> architectures that llama.cpp emits for the Qwen3.5 and Qwen3.6 families.
+> Upstream FreeToken reads GGUF for Gemma-4 only, only Q4_0/Q8_0/Q6_K, and only as a single
+> file. This fork widens all three: any ggml quant type the vendored kernels already handle,
+> the `qwen3moe` / `qwen35moe` / `qwen35` architectures covering the Qwen3, Qwen3.5 and
+> Qwen3.6 families, and split `-00001-of-000NN` checkpoints.
+>
+> Multi-shard matters more than it sounds. Every large GGUF ships split, so without it the
+> quant-type work was unreachable for exactly the models it was meant to serve. Point
+> `--model` at any shard or at the folder holding them.
 >
 > Proposed upstream as [FlashML-org/FreeToken#131](https://github.com/FlashML-org/FreeToken/pull/131).
 >
@@ -24,10 +28,12 @@
 >
 > RTX 4060 Laptop, 8GB VRAM, 64GB system RAM, routed experts offloaded to host memory.
 >
-> | Model | Quant | Result |
-> |---|---|---|
-> | [Ornith-1.5-35B-A3B](https://huggingface.co/vcruz305/Ornith-1.5-35B-A3B-GGUF) | IQ3_S | 8/8 factual, 47 to 50 tok/s |
-> | [Ornith-1.5-35B-A3B](https://huggingface.co/vcruz305/Ornith-1.5-35B-A3B-GGUF) | IQ3_XXS | 5/6 factual, 50 to 52 tok/s |
+> | Model | Arch | Quant | Result |
+> |---|---|---|---|
+> | [Ornith-1.5-35B-A3B](https://huggingface.co/vcruz305/Ornith-1.5-35B-A3B-GGUF) | qwen35moe | IQ3_S | 8/8 factual, 47 to 50 tok/s |
+> | [Ornith-1.5-35B-A3B](https://huggingface.co/vcruz305/Ornith-1.5-35B-A3B-GGUF) | qwen35moe | IQ3_XXS | 6/6 factual, 50 to 52 tok/s |
+> | Ornith-1.5-35B-A3B split into 3 shards | qwen35moe | IQ3_S | 6/6 factual, 44 to 46 tok/s |
+> | [Qwen3-30B-A3B](https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF) | qwen3moe | IQ4_XS | 6/6 factual, 45 to 47 tok/s |
 >
 > A 35B model with 3B active, in 16GB, decoding at 50 tok/s on a laptop GPU with 8GB of
 > VRAM. For reference, llama.cpp on the same file on CPU does 11 tok/s.
@@ -40,6 +46,7 @@
 >
 > | Model | Arch | Expert banks | Notes |
 > |---|---|---|---|
+> | [Qwen3-235B-A22B](https://huggingface.co/unsloth/Qwen3-235B-A22B-GGUF) | qwen3moe | check per quant | split, 3 to 10 shards |
 > | [Qwen3.5-122B-A10B](https://huggingface.co/unsloth/Qwen3.5-122B-A10B-GGUF) | qwen35moe | uniform at IQ3_S | should load as is |
 > | [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | qwen35moe | mixed at IQ3_S | needs a `--pure` quant |
 > | [Ornith-1.0-35B-AEON](https://huggingface.co/vcruz305/Ornith-1.0-35B-AEON-Ultimate-Uncensored-GGUF) | qwen35moe | mixed at Q4_K_M | needs a `--pure` quant |

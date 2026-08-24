@@ -11,47 +11,100 @@
 </p>
 
 
-> ### This fork: GGUF support for more quant types and Qwen3.5 models
+> ### This fork: GGUF support for the Qwen3.5 and Qwen3.6 families, and for every ggml quant type
 >
-> Upstream FreeToken loads GGUF for Gemma-4 only, and only Q4_0, Q8_0 and Q6_K. This fork
-> widens that. Proposed upstream as [FlashML-org/FreeToken#131](https://github.com/FlashML-org/FreeToken/pull/131).
+> Upstream FreeToken reads GGUF for Gemma-4 only, and only Q4_0, Q8_0 and Q6_K. Everything
+> else has to be a safetensors checkpoint. This fork widens both halves of that: any ggml
+> quant type the vendored kernels already handle, and the `qwen35moe` and `qwen35`
+> architectures that llama.cpp emits for the Qwen3.5 and Qwen3.6 families.
 >
-> **What works now**
+> Proposed upstream as [FlashML-org/FreeToken#131](https://github.com/FlashML-org/FreeToken/pull/131).
 >
-> | Model | Arch | Quant tested | Result |
+> #### Verified on my hardware
+>
+> RTX 4060 Laptop, 8GB VRAM, 64GB system RAM, routed experts offloaded to host memory.
+>
+> | Model | Quant | Result |
+> |---|---|---|
+> | [Ornith-1.5-35B-A3B](https://huggingface.co/vcruz305/Ornith-1.5-35B-A3B-GGUF) | IQ3_S | 8/8 factual, 47 to 50 tok/s |
+> | [Ornith-1.5-35B-A3B](https://huggingface.co/vcruz305/Ornith-1.5-35B-A3B-GGUF) | IQ3_XXS | 5/6 factual, 50 to 52 tok/s |
+>
+> A 35B model with 3B active, in 16GB, decoding at 50 tok/s on a laptop GPU with 8GB of
+> VRAM. For reference, llama.cpp on the same file on CPU does 11 tok/s.
+>
+> #### Supported by architecture
+>
+> These carry a `general.architecture` this fork now handles. I have not run all of them,
+> so this is "the loader covers it", not "I benchmarked it". Bank column is from reading
+> each file's tensor table.
+>
+> | Model | Arch | Expert banks | Notes |
 > |---|---|---|---|
-> | [Ornith-1.5-35B-A3B](https://huggingface.co/vcruz305/Ornith-1.5-35B-A3B-GGUF) | qwen35moe | IQ3_S | 8/8 factual, 47-50 tok/s |
-> | [Ornith-1.5-35B-A3B](https://huggingface.co/vcruz305/Ornith-1.5-35B-A3B-GGUF) | qwen35moe | IQ3_XXS | 5/6 factual, 50-52 tok/s |
-> | [Ornith-1.0-35B-AEON](https://huggingface.co/vcruz305/Ornith-1.0-35B-AEON-Ultimate-Uncensored-GGUF) | qwen35moe | needs a uniform-bank quant | covered by the same adapter |
-> | [Qwen3.8-27B](https://huggingface.co/vcruz305/Qwen3.8-27B-GGUF) | qwen35 (dense) | Q4_K_M | support added, test pending |
+> | [Qwen3.5-122B-A10B](https://huggingface.co/unsloth/Qwen3.5-122B-A10B-GGUF) | qwen35moe | uniform at IQ3_S | should load as is |
+> | [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | qwen35moe | mixed at IQ3_S | needs a `--pure` quant |
+> | [Ornith-1.0-35B-AEON](https://huggingface.co/vcruz305/Ornith-1.0-35B-AEON-Ultimate-Uncensored-GGUF) | qwen35moe | mixed at Q4_K_M | needs a `--pure` quant |
+> | [Qwen3.8-27B](https://huggingface.co/vcruz305/Qwen3.8-27B-GGUF) | qwen35 dense | none | Q4_K_M, test in progress |
+> | [Qwen3.6-27B](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF) | qwen35 dense | none | Q4_K_M |
+> | [Qwen3.5-27B](https://huggingface.co/unsloth/Qwen3.5-27B-GGUF) | qwen35 dense | none | Q4_K_M |
+> | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | qwen35 dense | none | Q4_K_M |
+> | [Qwen3.5-4B](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) | qwen35 dense | none | Q4_K_M |
 >
-> Measured on an RTX 4060 Laptop, 8GB VRAM, with the routed experts offloaded to host RAM.
-> More quants at [huggingface.co/vcruz305](https://huggingface.co/vcruz305/models).
+> Dense models have no expert banks, so the uniform-bank rule below does not apply to them
+> and ordinary `_M` quants are fine.
 >
-> **What changed**
+> More of my quants at [huggingface.co/vcruz305](https://huggingface.co/vcruz305/models).
 >
-> - All 21 ggml types are now described on the Python side. `csrc/gguf/` already dispatched
->   19 of them but the tables only listed 6, so K-quants and I-quants were unreachable for
->   every architecture, not just this one.
-> - Fixed a silent data-corruption bug: none of the five `switch (type)` blocks in
+> #### Quant types
+>
+> All 21 ggml types are now described on the Python side. `csrc/gguf/` already dispatched 19
+> of them, but the tables only listed 6, so K-quants and I-quants were unreachable for every
+> architecture rather than just this one.
+>
+> | Family | Types | Prefill | Decode |
+> |---|---|---|---|
+> | Standard | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 | MMQ | MMVQ |
+> | K-quants | Q2_K, Q3_K, Q4_K, Q5_K, Q6_K | MMQ | MMVQ |
+> | I-quants | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS | dequant plus matmul | MMVQ |
+>
+> I-quants have no MMQ kernel upstream, so prefill falls back to `ggml_dequantize` and a
+> torch matmul. That branch already existed but was unreachable, because `_MMQ` was tested
+> before `_DEQUANT` and the two sets were identical.
+>
+> #### What else changed
+>
+> - Fixed a silent data corruption bug. None of the five `switch (type)` blocks in
 >   `gguf_kernel.cu` had a `default:`, and the output tensor is allocated with
->   `torch::empty`. An unsupported quant type returned uninitialized memory instead of
->   raising. That one is worth having on its own.
-> - Added the `qwen35moe` and `qwen35` architectures, including the four transforms
->   llama.cpp's converter applies that a loader has to undo (`ssm_a` holds `A` rather than
->   `A_log`, the `(1+w)` norm shift is already folded in, V heads are stored tiled rather
->   than grouped, and merged projections are not uniformly typed).
-> - I-quants have no MMQ kernel, so prefill falls back to `ggml_dequantize` plus a torch
->   matmul. That branch existed already but was unreachable.
+>   `torch::empty`, so an unsupported quant type returned uninitialized memory instead of
+>   raising. `ggml_moe_get_block_size` returned 0. That one is worth having on its own,
+>   independent of the rest of this fork.
+> - Documented the four transforms llama.cpp's converter applies that a loader has to undo:
+>   `ssm_a` holds `A` rather than `A_log`, the `(1+w)` norm shift is already folded in, V
+>   heads are stored tiled rather than grouped when there are fewer K heads than V heads,
+>   and merged projections are not uniformly typed. None of these are visible to shape,
+>   dtype or byte identity checks. The model loads, runs at full speed, and produces fluent
+>   nonsense.
+> - Tests derive the block sizes from `ggml-common.h` and extract the `case` labels from
+>   `gguf_kernel.cu` at runtime, so the Python tables cannot drift from the kernels without
+>   a test failing.
 >
-> **Known limits**
+> #### Known limits
 >
-> - MoE expert banks must use one ggml type across all layers. llama.cpp's `_M` and `_XXS`
->   levels raise the precision of the first few layers' `ffn_down_exps`, so those refuse to
->   load with an error naming the offending layers. Quantize with `llama-quantize --pure`
->   to avoid it. Dense models have no expert banks and are unaffected.
-> - TP=1 only, the NextN/MTP block is dropped, and bank loading is serial.
+> - MoE expert banks have to use one ggml type across every layer. The GPU slot pool is a
+>   single allocation and `moe_vec.cuh` indexes it as `expert * nrows * (ncols / qk)` with no
+>   padding allowance, so two row strides in one pool would read every block at the wrong
+>   offset. llama.cpp's `_M` and `_XXS` levels raise the precision of the first few layers'
+>   `ffn_down_exps`, which trips this. Those refuse to load with an error naming the layers.
+>   Quantize with `llama-quantize --pure` to get one type throughout. Dense models are
+>   unaffected.
+> - TP=1 only, same as the existing Gemma-4 GGUF path.
+> - The NextN/MTP block is dropped, so no speculative decoding.
+> - Expert bank loading is serial, so first load of a 16GB checkpoint takes about a minute.
+>   Converting to FTW with `ft checkpoint` avoids paying it every time.
 > - Tested with the flashinfer attention backend. The triton fallback is unexercised here.
+> - First token argmax matches llama.cpp CPU on 2 of 6 single token prompts. Every
+>   disagreement is a plausible near tie, and this runs CUDA W4A8 MMVQ against CPU AVX, so I
+>   do not think exact agreement is reachable. Stating the number rather than implying it is
+>   bit exact.
 
 
 Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.

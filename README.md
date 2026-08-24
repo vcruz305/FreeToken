@@ -11,6 +11,49 @@
 </p>
 
 
+> ### This fork: GGUF support for more quant types and Qwen3.5 models
+>
+> Upstream FreeToken loads GGUF for Gemma-4 only, and only Q4_0, Q8_0 and Q6_K. This fork
+> widens that. Proposed upstream as [FlashML-org/FreeToken#131](https://github.com/FlashML-org/FreeToken/pull/131).
+>
+> **What works now**
+>
+> | Model | Arch | Quant tested | Result |
+> |---|---|---|---|
+> | [Ornith-1.5-35B-A3B](https://huggingface.co/vcruz305/Ornith-1.5-35B-A3B-GGUF) | qwen35moe | IQ3_S | 8/8 factual, 47-50 tok/s |
+> | [Ornith-1.5-35B-A3B](https://huggingface.co/vcruz305/Ornith-1.5-35B-A3B-GGUF) | qwen35moe | IQ3_XXS | 5/6 factual, 50-52 tok/s |
+> | [Ornith-1.0-35B-AEON](https://huggingface.co/vcruz305/Ornith-1.0-35B-AEON-Ultimate-Uncensored-GGUF) | qwen35moe | needs a uniform-bank quant | covered by the same adapter |
+> | [Qwen3.8-27B](https://huggingface.co/vcruz305/Qwen3.8-27B-GGUF) | qwen35 (dense) | Q4_K_M | support added, test pending |
+>
+> Measured on an RTX 4060 Laptop, 8GB VRAM, with the routed experts offloaded to host RAM.
+> More quants at [huggingface.co/vcruz305](https://huggingface.co/vcruz305/models).
+>
+> **What changed**
+>
+> - All 21 ggml types are now described on the Python side. `csrc/gguf/` already dispatched
+>   19 of them but the tables only listed 6, so K-quants and I-quants were unreachable for
+>   every architecture, not just this one.
+> - Fixed a silent data-corruption bug: none of the five `switch (type)` blocks in
+>   `gguf_kernel.cu` had a `default:`, and the output tensor is allocated with
+>   `torch::empty`. An unsupported quant type returned uninitialized memory instead of
+>   raising. That one is worth having on its own.
+> - Added the `qwen35moe` and `qwen35` architectures, including the four transforms
+>   llama.cpp's converter applies that a loader has to undo (`ssm_a` holds `A` rather than
+>   `A_log`, the `(1+w)` norm shift is already folded in, V heads are stored tiled rather
+>   than grouped, and merged projections are not uniformly typed).
+> - I-quants have no MMQ kernel, so prefill falls back to `ggml_dequantize` plus a torch
+>   matmul. That branch existed already but was unreachable.
+>
+> **Known limits**
+>
+> - MoE expert banks must use one ggml type across all layers. llama.cpp's `_M` and `_XXS`
+>   levels raise the precision of the first few layers' `ffn_down_exps`, so those refuse to
+>   load with an error naming the offending layers. Quantize with `llama-quantize --pure`
+>   to avoid it. Dense models have no expert banks and are unaffected.
+> - TP=1 only, the NextN/MTP block is dropped, and bank loading is serial.
+> - Tested with the flashinfer attention backend. The triton fallback is unexercised here.
+
+
 Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
 
 ## About

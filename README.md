@@ -124,8 +124,15 @@
 > two uniform ones are MXFP4, which has no `BLOCK_SHAPE` entry and no vendored kernel. The
 > `antirez` builds are uniform and do load. Check before downloading 90GB.
 >
-> **CUDA graph capture crashes on this configuration**, so it currently needs
-> `--cuda-graph-max-bs 0` and decode is slower than it should be. Being worked on.
+> **It is slow on this configuration: about 2 tok/s.** Not a bug, a consequence. WSL caps
+> CUDA pinning near 40% of RAM (measured 81.78 GiB of 204), and the banks are 145 GiB, so
+> 19 of 43 layers are OS-locked and computed on the CPU executor. The Q4_K CPU dot is a
+> scalar reference kernel, so each token does 6 experts x 19 layers of scalar work. An
+> AVX2/AVX-512 version is the obvious fix.
+>
+> The better fix is to not split at all: the 86.7GB `UD-IQ2XXS`-class build needs about
+> 75 GiB of banks, under the pin budget, so every layer stays on the GPU offload path. That
+> is the configuration to use if you want speed rather than the best quant.
 >
 > Host RAM is the binding constraint, not VRAM: the full expert set is held pinned, and WSL
 > caps CUDA pinning near 40% of RAM (measured 81.78 GiB of 204), which is why the residency

@@ -40,8 +40,8 @@ quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int k
 
 #pragma unroll
   for (int mask = 16; mask > 0; mask >>= 1) {
-    amax = fmaxf(amax, SGLANG_SHFL_XOR_SYNC_WIDTH(uint32_t(-1), amax, mask, 32));
-    sum += SGLANG_SHFL_XOR_SYNC_WIDTH(uint32_t(-1), sum, mask, 32);
+    amax = fmaxf(amax, SGLANG_SHFL_XOR_SYNC_WIDTH(0xffffffffffffffffull, amax, mask, 32));
+    sum += SGLANG_SHFL_XOR_SYNC_WIDTH(0xffffffffffffffffull, sum, mask, 32);
   }
 
   const float d = amax / 127;

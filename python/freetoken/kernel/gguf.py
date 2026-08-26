@@ -51,9 +51,15 @@ def _c_compiler_for(cxx: str) -> str:
 def _module():
     from torch.utils.cpp_extension import load
 
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
+    import torch
+
+    on_hip = bool(getattr(torch.version, "hip", None))
+    extra_cuda_cflags = ["-O3"]
+    if not on_hip:
+        # nvcc-only flag; hipcc already has relaxed constexpr as default.
+        extra_cuda_cflags.append("--expt-relaxed-constexpr")
     host_cxx = _host_compiler()
-    if host_cxx is not None:
+    if host_cxx is not None and not on_hip:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
         # libtorch/nvcc-compatible compiler. Force (not setdefault): the system
         # default (CXX unset -> g++) can be a gcc too new for the torch headers.

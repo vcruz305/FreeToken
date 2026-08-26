@@ -6,26 +6,45 @@ if TYPE_CHECKING:
     import torch
 
 
+def _torch_act_and_mul(fn, x: torch.Tensor, out: torch.Tensor | None = None):
+    a, b = x.chunk(2, dim=-1)
+    result = fn(a) * b
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
 def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
+    import torch
+
     from freetoken.kernel.backend import is_flashinfer_installed
 
     if is_flashinfer_installed():
         from flashinfer import silu_and_mul
+    elif getattr(torch.version, "hip", None):
+        # AMD ROCm port: the triton activation kernel fails LLVM register
+        # allocation on some RDNA3 shapes; plain torch ops stay correct.
+        return _torch_act_and_mul(torch.nn.functional.silu, x, out=out)
     else:
         from freetoken.kernel.triton.activation import silu_and_mul
 
-    return silu_and_mul(x, out=out)
+        return silu_and_mul(x, out=out)
 
 
 def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
+    import torch
+
     from freetoken.kernel.backend import is_flashinfer_installed
 
     if is_flashinfer_installed():
         from flashinfer import gelu_and_mul
+    elif getattr(torch.version, "hip", None):
+        return _torch_act_and_mul(torch.nn.functional.gelu, x, out=out)
     else:
         from freetoken.kernel.triton.activation import gelu_and_mul
 
-    return gelu_and_mul(x, out=out)
+        return gelu_and_mul(x, out=out)
 
 
 def gelu_tanh_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):

@@ -43,7 +43,7 @@ static __global__ void moe_vec_q(
   // sum up partial sums and write back result
 #pragma unroll
   for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-    tmp += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), tmp, mask);
+    tmp += SGLANG_SHFL_XOR_SYNC(0xffffffffffffffffull, tmp, mask);
   }
 
   if (threadIdx.x == 0) {

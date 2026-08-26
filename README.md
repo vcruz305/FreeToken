@@ -11,18 +11,23 @@
 </p>
 
 
-> ### This fork: multi-shard GGUF, the Qwen3 / Qwen3.5 / Qwen3.6 families, and every ggml quant type
+> ### This fork: multi-shard GGUF, DeepSeek-V4, the Qwen3 / Qwen3.5 / Qwen3.6 families, and every ggml quant type
 >
 > Upstream FreeToken reads GGUF for Gemma-4 only, only Q4_0/Q8_0/Q6_K, and only as a single
 > file. This fork widens all three: any ggml quant type the vendored kernels already handle,
 > the `qwen3moe` / `qwen35moe` / `qwen35` architectures covering the Qwen3, Qwen3.5 and
-> Qwen3.6 families, and split `-00001-of-000NN` checkpoints.
+> Qwen3.6 families, the `deepseek4` architecture (DeepSeek-V4-Flash), and split
+> `-00001-of-000NN` checkpoints.
 >
 > Multi-shard matters more than it sounds. Every large GGUF ships split, so without it the
 > quant-type work was unreachable for exactly the models it was meant to serve. Point
 > `--model` at any shard or at the folder holding them.
 >
-> Proposed upstream as [FlashML-org/FreeToken#131](https://github.com/FlashML-org/FreeToken/pull/131).
+> Proposed upstream as [FlashML-org/FreeToken#131](https://github.com/FlashML-org/FreeToken/pull/131)
+> (quant types and the Qwen architectures),
+> [#154](https://github.com/FlashML-org/FreeToken/pull/154) (multi-shard),
+> [#138](https://github.com/FlashML-org/FreeToken/pull/138) (kernel guards) and
+> [#210](https://github.com/FlashML-org/FreeToken/pull/210) (DeepSeek-V4).
 >
 > #### Verified on my hardware
 >
@@ -103,6 +108,29 @@
 >   `ffn_down_exps`, which trips this. Those refuse to load with an error naming the layers.
 >   Quantize with `llama-quantize --pure` to get one type throughout. Dense models are
 >   unaffected.
+> #### DeepSeek-V4-Flash
+>
+> A 284B MoE with MLA, DSA sparse attention, hyper-connections and hash routing. Verified on
+> a Quadro RTX 6000 (Turing, sm_75, 24GB) with 204 GiB of RAM available to WSL, serving the
+> 164GB [`antirez/deepseek-v4-gguf`](https://huggingface.co/antirez/deepseek-v4-gguf)
+> Q4KExperts build: 43 layers, 256 experts, 145 GiB of expert banks split 24 layers
+> GPU-pinned and 19 OS-locked for CPU decode, about 18GB VRAM. Correct at temperature 0
+> (`"The capital city of France is"` -> `" Paris."`).
+>
+> Two caveats worth reading before you try it.
+>
+> **Most published checkpoints will not load.** Of the thirteen
+> `unsloth/DeepSeek-V4-Flash-0731-GGUF` variants, eleven mix ggml types across layers and the
+> two uniform ones are MXFP4, which has no `BLOCK_SHAPE` entry and no vendored kernel. The
+> `antirez` builds are uniform and do load. Check before downloading 90GB.
+>
+> **CUDA graph capture crashes on this configuration**, so it currently needs
+> `--cuda-graph-max-bs 0` and decode is slower than it should be. Being worked on.
+>
+> Host RAM is the binding constraint, not VRAM: the full expert set is held pinned, and WSL
+> caps CUDA pinning near 40% of RAM (measured 81.78 GiB of 204), which is why the residency
+> split moves layers to the CPU executor.
+>
 > - TP=1 only, same as the existing Gemma-4 GGUF path.
 > - The NextN/MTP block is dropped, so no speculative decoding.
 > - Expert bank loading is serial, so first load of a 16GB checkpoint takes about a minute.

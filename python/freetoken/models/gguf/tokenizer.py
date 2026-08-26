@@ -23,6 +23,11 @@ _TOKENIZER_ARCH = {
     "qwen35moe": "qwen2",
     "qwen35": "qwen2",
     "qwen3moe": "qwen2",
+    # tokenizer.ggml.model is gpt2 (BPE), pre joyai-llm, 129280 entries. The llama
+    # converter is sentencepiece-shaped and encodes a space as U+2581; a GPT2 BPE
+    # vocab uses the Ġ prefix instead, so that mapping silently DROPS every space on
+    # detokenization ("ThecapitalcityofFranceisParis"). qwen2 is the GPT2-BPE entry.
+    "deepseek4": "qwen2",
 }
 
 # Per-arch chat/stop tokens, in preference order: the first one present in the vocab
@@ -36,6 +41,10 @@ _STOP_TOKENS: dict[str, tuple[str, ...]] = {
     # Dense sibling: same vocab and same chat markers as the MoE variant.
     "qwen35": ("<|im_end|>", "<|endoftext|>"),
     "qwen3moe": ("<|im_end|>", "<|endoftext|>"),
+    # Read from the vocab: eos id 1 is the document end, <|EOT|> (128805) ends a
+    # chat turn. <｜User｜> is deliberately not a stop -- the template emits it
+    # before the model speaks, not after.
+    "deepseek4": ("<|EOT|>", "<｜end▁of▁sentence｜>"),
 }
 
 

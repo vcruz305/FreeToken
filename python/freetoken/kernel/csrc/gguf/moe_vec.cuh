@@ -11,7 +11,8 @@ static __global__ void moe_vec_q(
     const int topk,
     const int ncols,
     const int nrows,
-    const int token_stride) {
+    const int token_stride,
+    const int row_stride_bytes) {
   const auto row = blockIdx.x * blockDim.y + threadIdx.y;
 
   const auto token = blockIdx.z / topk;
@@ -27,11 +28,18 @@ static __global__ void moe_vec_q(
   // partial sum for each thread
   float tmp = 0.0f;
 
-  const block_q_t* x = ((const block_q_t*)vx) + expert * nrows * blocks_per_row;
+  // Rows are addressed through an explicit byte stride instead of blocks_per_row so that
+  // one slot pool can serve layers whose quant type -- and therefore whose natural row size
+  // -- differs. llama.cpp's "dynamic" quants (unsloth's UD-* family) raise the precision of
+  // a handful of layers, so a checkpoint's expert banks are routinely non-uniform. For an
+  // unpadded pool row_stride_bytes == blocks_per_row * sizeof(block_q_t), which is exactly
+  // the arithmetic this replaces.
+  const block_q_t* x = (const block_q_t*)((const char*)vx +
+                                          ((size_t)expert * nrows + row) * (size_t)row_stride_bytes);
   const block_q8_1* y = (const block_q8_1*)(((const int*)vy) + token * token_stride);
 
   for (auto i = threadIdx.x / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
-    const int ibx = row * blocks_per_row + i;  // x block index
+    const int ibx = i;  // x block index, relative to this row's base pointer
 
     const int iby = i * (qk / QK8_1);  // y block index that aligns with ibx
 
@@ -79,6 +87,7 @@ static void moe_vec_launch(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
@@ -93,7 +102,7 @@ static void moe_vec_launch(
             (const void*)(((const int*)vy) + (size_t)t0 * token_stride),
             dst + (size_t)t0 * top_k * nrows,
             topk_ids + (size_t)t0 * top_k,
-            top_k, ncols, nrows, token_stride);
+            top_k, ncols, nrows, token_stride, row_stride_bytes);
   }
 }
 
@@ -108,9 +117,10 @@ static void moe_vec_q4_0_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -124,9 +134,10 @@ static void moe_vec_q4_1_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK4_0, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -140,9 +151,10 @@ static void moe_vec_q5_0_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -156,9 +168,10 @@ static void moe_vec_q5_1_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK5_1, QI5_1, block_q5_1, VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -172,9 +185,10 @@ static void moe_vec_q8_0_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -188,9 +202,10 @@ static void moe_vec_q2_K_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -204,9 +219,10 @@ static void moe_vec_q3_K_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -220,9 +236,10 @@ static void moe_vec_q4_K_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -236,9 +253,10 @@ static void moe_vec_q5_K_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -252,9 +270,10 @@ static void moe_vec_q6_K_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -268,9 +287,10 @@ static void moe_vec_iq2_xxs_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK_K, QI2_XXS, block_iq2_xxs, 1, vec_dot_iq2_xxs_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -284,9 +304,10 @@ static void moe_vec_iq2_xs_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK_K, QI2_XS, block_iq2_xs, 1, vec_dot_iq2_xs_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -300,9 +321,10 @@ static void moe_vec_iq2_s_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK_K, QI2_S, block_iq2_s, 1, vec_dot_iq2_s_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -316,9 +338,10 @@ static void moe_vec_iq3_xxs_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK_K, QI3_XXS, block_iq3_xxs, 1, vec_dot_iq3_xxs_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -332,9 +355,10 @@ static void moe_vec_iq1_s_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK_K, QI1_S, block_iq1_s, 1, vec_dot_iq1_s_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -348,9 +372,10 @@ static void moe_vec_iq1_m_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK_K, QI1_M, block_iq1_m, 1, vec_dot_iq1_m_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -364,9 +389,10 @@ static void moe_vec_iq4_nl_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK4_NL, QI4_NL, block_iq4_nl, VDR_Q4_0_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -380,9 +406,10 @@ static void moe_vec_iq4_xs_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK_K, QI4_XS, block_iq4_xs, 1, vec_dot_iq4_xs_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }
 
 template <typename scalar_t>
@@ -396,7 +423,8 @@ static void moe_vec_iq3_s_q8_1_cuda(
     const int ncols,
     const int nrows,
     const int token_stride,
+    const int row_stride_bytes,
     cudaStream_t stream) {
   moe_vec_launch<scalar_t, QK_K, QI3_XS, block_iq3_s, 1, vec_dot_iq3_s_q8_1>(
-      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, row_stride_bytes, stream);
 }

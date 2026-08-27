@@ -249,14 +249,14 @@ class ModelConfig:
     # bank row stride (``row_bytes``) is only knowable from the file. The offload cache
     # sizes its slot pool from these and the MoE kernels take the type as an argument.
     #
-    # Both entries must be uniform across layers: the GPU slot pool is one contiguous
-    # allocation shared by every layer, and moe_vec.cuh addresses it as
-    # ``expert * nrows * (ncols / qk)`` with no padding allowance -- so two layers with
-    # different row strides in one pool would read every block at the wrong offset.
-    # ``load_gguf_expert_sources`` raises when a checkpoint violates that (llama.cpp's
-    # *_M mixes do: Ornith IQ3_M splits ffn_down_exps across Q4_K and IQ3_S, while its
-    # IQ3_S/IQ3_XXS siblings are uniform and load fine).
-    gguf_expert_types: tuple[int, int] | None = None
+    # Each entry is one ggml type PER LAYER: (gate_up_types, down_types), both of length
+    # num_layers. llama.cpp's "dynamic" quants -- unsloth's UD-* family in particular --
+    # deliberately raise the precision of a few layers, so a bank's type routinely varies
+    # (UD-Q4_K_XL is Q4_K on 47 layers and Q5_K on one). The slot pool is still a single
+    # allocation, but its rows are padded to the widest layer's row_bytes and the kernel
+    # walks them by an explicit byte stride, so one pool can hold several types. The MoE
+    # forward passes the type of the layer it is running.
+    gguf_expert_types: tuple[tuple[int, ...], tuple[int, ...]] | None = None
     # Path to the .gguf this config was parsed from, for ``expert_quant == "gguf"``. The
     # model's __init__ swaps its dense ops for GGUF ops and has to size each packed buffer
     # by the ggml type that tensor actually uses, which is only in the file -- unlike

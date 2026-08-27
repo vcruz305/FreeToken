@@ -1223,9 +1223,13 @@ def _cpu_moe_executor_viable(model_config) -> bool:
         types = getattr(model_config, "gguf_expert_types", None)
         if not types:
             return False
-        gate_up, down = int(types[0]), int(types[1])
-        # one weight_format serves both banks, so mixed types cannot run on the CPU path
-        return gate_up == down and gate_up in _GGML_TO_CPU_FMT
+        # Types are per-layer. The CPU executor picks one weight_format for the whole run,
+        # so it needs a single type across both banks and every layer; a dynamic quant that
+        # varies by layer stays on the GPU offload path (which strides per layer instead).
+        distinct = set(int(t) for bank in types for t in bank)
+        if len(distinct) != 1:
+            return False
+        return distinct.pop() in _GGML_TO_CPU_FMT
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 

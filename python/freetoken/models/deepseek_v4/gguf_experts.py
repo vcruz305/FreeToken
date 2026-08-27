@@ -110,14 +110,16 @@ def gguf_expert_specs(
     out: dict[str, tuple[tuple[int, ...], torch.dtype]] = {}
     for name, elems in (("gate_up", H), ("down", I)):
         distinct = sorted(set(types[name]))
-        if len(distinct) != 1:
-            names = [GGML_NAME.get(t, t) for t in distinct]
-            raise ValueError(
-                f"deepseek4 expert bank {name!r} mixes ggml types across layers ({names}); "
-                "a bank must be uniform because its slot pool is one allocation with one "
-                "stride"
-            )
-        rb = row_bytes(elems, distinct[0])
+        # One pool, possibly several types: size every row to the widest type present and
+        # let moe_vec.cuh stride by it. A layer quantized more tightly just leaves the tail
+        # of its rows unused -- the kernel reads ncols/qk blocks from each row's base, and
+        # qk comes from that layer's own type, so the padding is never read. For the dynamic
+        # quants this costs almost nothing (UD-Q4_K_XL pads 47 Q4_K layers to one Q5_K row).
+        rb = max(row_bytes(elems, t) for t in distinct)
+        if len(distinct) > 1:
+            # Row bases must stay aligned for any block struct they may be cast to. A
+            # uniform bank keeps its exact natural stride so its layout is unchanged.
+            rb = (rb + 7) // 8 * 8
         shape = (E, 2 * I, rb) if name == "gate_up" else (E, H, rb)
         out[name] = (shape, torch.uint8)
     return out
@@ -176,8 +178,14 @@ def load_gguf_expert_sources(
                 # returns [E*H, row_bytes(I)] already in expert-major row order. Reshaping
                 # to [E, H, row_bytes(I)] is a view, not a copy. Note the row_bytes is over
                 # I (the fastest dim), not over E.
-                down_rb = specs["down"][0][2]
-                banks["down"][layer].copy_(t.packed().reshape(E, H, down_rb))
+                # This layer's own row size, which is what t.packed() carries. The bank
+                # row may be wider (padded to the widest layer in the bank), so write into
+                # the prefix and leave the tail alone -- the kernel never reads past
+                # ncols/qk blocks from each row's base.
+                down_rb = row_bytes(I, types["down"][layer])
+                banks["down"][layer][:, :, :down_rb].copy_(
+                    t.packed().reshape(E, H, down_rb)
+                )
                 seen_down.add(layer)
                 if tracker is not None:
                     tracker.note(layer)
@@ -185,7 +193,7 @@ def load_gguf_expert_sources(
                 continue
 
             if layer in gate_buf and layer in up_buf:
-                rb = specs["gate_up"][0][2]
+                rb = row_bytes(H, types["gate_up"][layer])  # this layer's own row size
                 # gate and up each arrive as [E*I, row_bytes(H)], and ggml's fastest-first
                 # dims [H, I, E] make E the slowest axis, so those rows are EXPERT-MAJOR:
                 # expert e owns rows [e*I, (e+1)*I).
@@ -201,7 +209,7 @@ def load_gguf_expert_sources(
                 # exact bug cost real debugging time on qwen35moe.
                 g = gate_buf[layer].reshape(E, I, rb)
                 u = up_buf[layer].reshape(E, I, rb)
-                banks["gate_up"][layer].copy_(torch.cat([g, u], dim=1))
+                banks["gate_up"][layer][:, :, :rb].copy_(torch.cat([g, u], dim=1))
                 del gate_buf[layer], up_buf[layer]
                 if tracker is not None:
                     tracker.note(layer)

@@ -125,7 +125,7 @@ class OffloadMoeCache:
     # type per tensor -- so the MoE kernels need the types handed to them at dispatch.
     # Per-bank (each bank owns its own slot pool) but NOT per-layer: one pool is shared by
     # all layers and moe_vec.cuh addresses it with no padding allowance.
-    gguf_expert_types: tuple[int, int] | None = None
+    gguf_expert_types: tuple[tuple[int, ...], tuple[int, ...]] | None = None
     # Decode mode + bank layout; per-layer CPU routing is cpu_layer_ids. "gpu":
     # GPU-tiled banks, all decode on GPU (stream misses over PCIe into the slot
     # cache, GEMM on GPU). "cpu": native (CPU-readable) banks + a CPU executor;

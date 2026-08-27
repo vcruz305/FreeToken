@@ -533,9 +533,10 @@ class OffloadMoELayer(MoELayer):
             )
         if fmt == "gguf":
             # Same MMVQ grouped GEMV as q4_0, but the two banks carry whatever ggml types
-            # the checkpoint chose (Ornith IQ3_S: both banks IQ3_S; the attention-side
-            # projections mix, but expert banks must be uniform -- see ModelConfig
-            # .gguf_expert_types for why the slot pool cannot hold two strides).
+            # the checkpoint chose, and those may differ per layer: llama.cpp's dynamic
+            # quants raise the precision of a few layers. The slot pool is padded to the
+            # widest row and the kernel strides by it, so all this has to do is hand the
+            # kernel the type belonging to the layer being run.
             from freetoken.moe.fused_q4_0 import fused_experts_gguf
 
             gate_up, down = views
@@ -544,7 +545,8 @@ class OffloadMoELayer(MoELayer):
                 "quant_format 'gguf' requires gguf_expert_types on the offload cache "
                 "(set from ModelConfig.gguf_expert_types at cache construction)"
             )
-            t_gate_up, t_down = types
+            t_gate_up = types[0][self.layer_id]
+            t_down = types[1][self.layer_id]
             return fused_experts_gguf(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
                 quant_type=t_gate_up, down_quant_type=t_down,

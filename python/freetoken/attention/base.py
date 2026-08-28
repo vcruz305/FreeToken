@@ -37,6 +37,16 @@ class AttentionSpec:
     sliding_window: int | None = None
     sm_scale: float | None = None
     sinks: torch.Tensor | None = None
+    # Restrict which KV cells this layer may attend to, as a replacement (indptr, indices)
+    # pair rather than a mask. Sliding-window attention already restricts keys by swapping
+    # the index list; this is the same mechanism for a content-chosen set, which is what a
+    # learned key indexer produces. Both must be given together: a filtered list has a
+    # different length, so the request offsets change with it.
+    #
+    # Only meaningful where a request contributes ONE query (decode), since indptr is
+    # per-request and cannot express a different selection per query.
+    kv_indptr: torch.Tensor | None = None
+    kv_indices: torch.Tensor | None = None
 
 
 @dataclass

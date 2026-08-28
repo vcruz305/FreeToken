@@ -158,8 +158,18 @@ class TritonAttentionBackend(BaseAttnBackend):
 
         spec = attn_spec or AttentionSpec()
         indices = metadata.indices
+        indptr = metadata.indptr
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
+        if spec.kv_indices is not None:
+            # A caller-chosen key subset. Unlike the SWA swap this changes the LENGTH of
+            # the list, so the request offsets must come with it.
+            assert spec.kv_indptr is not None, (
+                "AttentionSpec.kv_indices needs kv_indptr: a filtered index list has "
+                "different request offsets than the full one"
+            )
+            indices = spec.kv_indices
+            indptr = spec.kv_indptr
         scale = spec.sm_scale if spec.sm_scale is not None else q.shape[-1] ** -0.5
         if metadata.is_decode and q.dtype in (torch.float16, torch.bfloat16):
             bs = metadata.indptr.numel() - 1
@@ -171,7 +181,7 @@ class TritonAttentionBackend(BaseAttnBackend):
                 q=q,
                 k_cache=k_cache,
                 v_cache=v_cache,
-                indptr=metadata.indptr,
+                indptr=indptr,
                 indices=indices,
                 q_positions=metadata.q_positions,
                 attn_logits=metadata.attn_logits[:bs],
@@ -192,7 +202,7 @@ class TritonAttentionBackend(BaseAttnBackend):
                 k_cache=k_cache,
                 v_cache=v_cache,
                 qo_indptr=metadata.cu_seqlens_q_gpu,
-                kv_indptr=metadata.indptr,
+                kv_indptr=indptr,
                 kv_indices=indices,
                 prefix_lens=metadata.prefix_lens,
                 max_q_len=metadata.max_q_len,
@@ -206,7 +216,7 @@ class TritonAttentionBackend(BaseAttnBackend):
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
-            indptr=metadata.indptr,
+            indptr=indptr,
             indices=indices,
             q_to_req=metadata.q_to_req,
             q_positions=metadata.q_positions,

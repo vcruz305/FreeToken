@@ -21,22 +21,30 @@ class _DepthwiseConv1d(BaseOP):
 
 
 class _GatedRMSNorm(BaseOP):
-    """RMSNorm of x followed by a silu(z) gate (HF Qwen3_5MoeRMSNormGated).
+    """RMSNorm of x followed by an activation(z) gate (HF Qwen3_5MoeRMSNormGated).
 
-    Uses the fused fla ``rms_norm_gated`` triton kernel (norm(x) * silu(z) in one
-    kernel) instead of the unfused pow/mean/rsqrt/mul/silu chain, matching sglang's
-    ``RMSNormGated`` -- collapses ~8 elementwise kernels per GDN layer into one."""
+    Uses the fused fla ``rms_norm_gated`` triton kernel (norm(x) * act(z) in one kernel)
+    instead of the unfused pow/mean/rsqrt/mul/act chain, matching sglang's
+    ``RMSNormGated`` -- collapses ~8 elementwise kernels per GDN layer into one.
 
-    def __init__(self, dim: int, eps: float):
+    ``activation`` is a parameter because qwen4exp's GDN is otherwise identical to
+    Qwen3.5's but gates with ``sigmoid`` rather than ``silu``. llama.cpp calls that out as
+    "the one numerical difference from Qwen3.5's GDN" (src/models/qwen4exp.cpp,
+    build_norm_gated). Both produce the same shapes, so taking the default here for a
+    qwen4exp checkpoint would degrade output with nothing to show for it.
+    """
+
+    def __init__(self, dim: int, eps: float, activation: str = "silu"):
         self.weight = torch.empty(dim)
         self.eps = eps
+        self.activation = activation
 
     def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.fla import rms_norm_gated
 
         return rms_norm_gated(
             x=x, weight=self.weight, bias=None, z=z, eps=self.eps,
-            is_rms_norm=True, norm_before_gate=True, activation="silu",
+            is_rms_norm=True, norm_before_gate=True, activation=self.activation,
         )
 
 
@@ -53,9 +61,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     def __init__(
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, expert_quant: str = "none",
-        attn_quant: str = "none",
+        attn_quant: str = "none", gate_activation: str = "silu",
     ):
         self.layer_id = layer_id
+        self.gate_activation = gate_activation
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
         # [V, K] while the LinearStatePool declares it [K, V]; these coincide (and the
         # hybrid-radix snapshot scatter h[h_row]->slot is a plain copy) only when the two head
@@ -97,7 +106,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # *.A_log / *.dt_bias from the model-dtype downcast.
         self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
         self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
-        self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps)
+        self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=gate_activation)
         # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
         # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
         # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.

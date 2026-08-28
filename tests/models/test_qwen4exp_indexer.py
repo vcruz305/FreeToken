@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from freetoken.models.qwen4exp.indexer import (
+    block_positions,
     block_scores,
     expand_to_tokens,
     pool_blocks,
@@ -32,13 +33,13 @@ def _rand(*shape, seed=0):
 
 
 def ref_pool(keys, r):
-    """Mean over each block's live members, as ggml does by gathering its cells."""
+    """Mean over each COMPLETE block's members. An incomplete block is not pooled at all --
+    llama.cpp forces its cells in via the bias instead."""
     n_kv, d = keys.shape
-    n_blocks = (n_kv + r - 1) // r
+    n_blocks = n_kv // r
     out = np.zeros((n_blocks, d))
     for b in range(n_blocks):
-        members = keys[b * r : min((b + 1) * r, n_kv)]
-        out[b] = members.mean(axis=0)
+        out[b] = keys[b * r : (b + 1) * r].mean(axis=0)
     return out
 
 
@@ -57,19 +58,35 @@ def ref_scores(q, pooled):
 
 
 def test_pooling_matches_the_reference():
-    keys = _rand(13, IDX_DIM, seed=1)          # 13 cells -> a partial trailing block
+    keys = _rand(13, IDX_DIM, seed=1)          # 13 cells -> 3 whole blocks + a 1-cell tail
     got = pool_blocks(keys, RATIO)
     want = ref_pool(keys.numpy(), RATIO)
-    assert got.shape == (4, IDX_DIM)
+    assert got.shape == (3, IDX_DIM), "the ragged tail is not a block"
     np.testing.assert_allclose(got.numpy(), want, rtol=1e-12, atol=1e-12)
 
 
-def test_partial_trailing_block_averages_only_live_members():
-    """Zero-padding to a full block and dividing by r would drag the last block's mean
-    toward zero, changing which blocks win."""
-    keys = torch.ones(5, IDX_DIM, dtype=torch.float64)
-    pooled = pool_blocks(keys, RATIO)
-    np.testing.assert_allclose(pooled[-1].numpy(), np.ones(IDX_DIM))
+def test_incomplete_trailing_block_is_not_pooled():
+    """llama.cpp: "an incomplete block cannot be pooled; the bias forces those tail cells
+    in". Pooling it would invent a score for the newest tokens and let them lose the
+    top-k -- the opposite of what the model expects."""
+    assert pool_blocks(_rand(13, IDX_DIM), RATIO).shape[0] == 3
+    assert pool_blocks(_rand(3, IDX_DIM), RATIO).shape[0] == 0
+
+
+def test_the_ragged_tail_is_always_selected():
+    """Its cells are the most recent tokens and are never scored, so they must be kept
+    whatever the block scores say."""
+    scores = torch.full((2, 13), -1e9, dtype=torch.float64)
+    mask = select_topk(scores, top_k=1, compress_ratio=RATIO)
+    assert mask[:, 12].all(), "the 1-cell tail must be forced in"
+
+
+def test_block_positions_are_the_first_token():
+    """"block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio". Using the
+    last member would rotate every pooled key up to ratio-1 positions too far."""
+    np.testing.assert_array_equal(
+        block_positions(4, RATIO).numpy(), np.array([0, 4, 8, 12])
+    )
 
 
 def test_scores_match_the_reference():
@@ -143,8 +160,11 @@ def test_causal_short_prefix_selects_all_it_may_see():
 def test_block_count_and_mask_width_are_consistent(n_kv):
     keys = _rand(n_kv, IDX_DIM, seed=11)
     pooled = pool_blocks(keys, RATIO)
-    assert pooled.shape[0] == (n_kv + RATIO - 1) // RATIO
-    q = _rand(2, HEADS, IDX_DIM, seed=12)
-    cell_block = torch.arange(n_kv) // RATIO
-    tok = expand_to_tokens(block_scores(q, pooled), cell_block)
-    assert tok.shape == (2, n_kv)
+    n_blocks = n_kv // RATIO
+    assert pooled.shape[0] == n_blocks
+    if n_blocks:
+        q = _rand(2, HEADS, IDX_DIM, seed=12)
+        # only cells inside whole blocks carry a block score; the tail is forced in
+        cell_block = torch.arange(n_blocks * RATIO) // RATIO
+        tok = expand_to_tokens(block_scores(q, pooled), cell_block)
+        assert tok.shape == (2, n_blocks * RATIO)

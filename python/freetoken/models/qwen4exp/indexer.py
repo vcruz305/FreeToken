@@ -27,23 +27,32 @@ import torch
 
 
 def pool_blocks(keys: torch.Tensor, compress_ratio: int) -> torch.Tensor:
-    """Mean-pool raw indexer keys into blocks.
+    """Mean-pool raw indexer keys into COMPLETE blocks.
 
-    ``keys`` is ``[n_kv, idx_dim]`` in cell order. Returns ``[n_blocks, idx_dim]`` where
-    ``n_blocks = ceil(n_kv / compress_ratio)``. A trailing partial block averages only its
-    live members, which is what pooling over its actual cells does.
+    ``keys`` is ``[n_kv, idx_dim]`` in cell order. Returns ``[n_kv // r, idx_dim]``.
+
+    Only whole blocks are pooled. llama.cpp is explicit that "an incomplete block cannot be
+    pooled; the bias below forces those tail cells in" -- the ragged tail is never scored,
+    it is always attended. Averaging a partial block instead would both invent a score for
+    it and let it lose the top-k, dropping the most recent tokens, which is the opposite of
+    what the model expects.
     """
     n_kv, idx_dim = keys.shape
-    r = compress_ratio
-    n_blocks = (n_kv + r - 1) // r
-    pad = n_blocks * r - n_kv
-    if pad:
-        keys = torch.cat([keys, keys.new_zeros(pad, idx_dim)], dim=0)
-    blocks = keys.reshape(n_blocks, r, idx_dim).sum(dim=1)
-    counts = keys.new_full((n_blocks, 1), float(r))
-    if pad:
-        counts[-1] = r - pad
-    return blocks / counts
+    n_blocks = n_kv // compress_ratio
+    if n_blocks == 0:
+        return keys.new_zeros(0, idx_dim)
+    whole = keys[: n_blocks * compress_ratio]
+    return whole.reshape(n_blocks, compress_ratio, idx_dim).mean(dim=1)
+
+
+def block_positions(n_blocks: int, compress_ratio: int, device=None) -> torch.Tensor:
+    """Rope position of each pooled block: its FIRST token, ``b * compress_ratio``.
+
+    From llama.cpp: "block b covers [b*ratio, (b+1)*ratio), so its first token is at
+    b*ratio". Using the last member instead would rotate every pooled key by up to
+    ``ratio - 1`` positions too far.
+    """
+    return torch.arange(n_blocks, device=device) * compress_ratio
 
 
 def block_scores(q: torch.Tensor, pooled: torch.Tensor) -> torch.Tensor:
@@ -85,6 +94,9 @@ def select_topk(
     n_tokens, n_kv = token_scores.shape
     width = min(n_kv, top_k + compress_ratio - 1)
 
+    # Cells past the last whole block are the ragged tail: never scored, always attended.
+    tail_start = (n_kv // compress_ratio) * compress_ratio
+
     scores = token_scores
     if causal_len is not None:
         pos = torch.arange(n_kv, device=scores.device).unsqueeze(0)
@@ -94,7 +106,10 @@ def select_topk(
     idx = scores.topk(width, dim=-1).indices
     mask = torch.zeros_like(scores, dtype=torch.bool)
     mask.scatter_(1, idx, True)
+    if tail_start < n_kv:
+        mask[:, tail_start:] = True
     if causal_len is not None:
-        # topk still returns indices when fewer than `width` entries are finite.
+        # topk still returns indices when fewer than `width` entries are finite, and the
+        # forced tail must not reach past what a query may legally see.
         mask &= allowed
     return mask

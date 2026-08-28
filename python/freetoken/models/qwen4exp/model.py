@@ -112,16 +112,24 @@ class Qwen4ExpDecoderLayer(BaseOP):
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, state: torch.Tensor) -> torch.Tensor:
+        # The residual stream carries exactly one dtype. A sublayer can hand back something
+        # wider -- the triton attention backend accumulates in float32, and a GGUFLinear
+        # returns whatever dtype its activation was, since its weight is packed uint8 and
+        # cannot mismatch. Without pinning it here that float32 rides the residual through
+        # every later layer until it meets the first module with a real typed weight, which
+        # is a confusing failure far from its cause and, on Turing, silently selects a GEMM
+        # path many times slower than the one asked for.
         mixed, inject = self.hc_attn.mix(state)
         out = (
             self.linear_attn.forward(mixed)
             if self._is_linear
             else self.self_attn.forward(mixed)
         )
-        state = self.hc_attn.combine(state, out, inject)
+        state = self.hc_attn.combine(state, out.to(state.dtype), inject)
 
         mixed, inject = self.hc_ffn.mix(state)
-        state = self.hc_ffn.combine(state, self.mlp.forward(mixed), inject)
+        ffn_out = self.mlp.forward(mixed).to(state.dtype)
+        state = self.hc_ffn.combine(state, ffn_out, inject)
         return state
 
 
@@ -245,7 +253,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         the hashed rows. Without this a captured graph would contain an unpinned H2D copy
         and capture fails.
         """
-        return {"ple_emb": (self._hidden_size, torch.bfloat16)}
+        # The buffer dtype must be the model's. Hardcoding bf16 here made PLE's
+        # contribution bf16 under --dtype float16, and float16 + bfloat16 promotes to
+        # float32, so the whole residual silently widened from one layer onward.
+        return {"ple_emb": (self._hidden_size, self.model.hc_head.norm.dtype)}
 
     def prepare_host_inputs(self, batch) -> None:
         """Hash each position's n-gram window and gather its PLE rows.

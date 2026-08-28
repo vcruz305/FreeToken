@@ -14,9 +14,11 @@ The architecture is largely two things FreeToken already serves, bolted together
 and three things it does not:
 
 * **gated attention**: on full-attention layers ``attn_q`` is [2560, 12288], twice the
-  24*256 the head geometry calls for, because it carries its own gate concatenated after
-  the queries. Those layers have no separate ``attn_gate`` while the SSM layers do, and
-  that presence/absence pattern is what makes the fusion unambiguous.
+  24*256 the head geometry calls for, because each head's queries are followed by that
+  head's gate. The layout is interleaved per head -- [h0_q, h0_gate, h1_q, h1_gate, ...] --
+  not two contiguous halves; see ``attention.split_q_and_gate``. Those layers have no
+  separate ``attn_gate`` while the SSM layers do, and that presence/absence pattern is
+  what makes the fusion unambiguous.
 * **low-rank hyper-connections** standing in for the usual pre-norms. There is no
   ``attn_norm`` and no ``ffn_norm`` anywhere in the file, and no ``output_norm`` global;
   ``hc_attn_norm``, ``hc_ffn_norm`` and ``output_hc_norm`` take their place. This is not
@@ -124,7 +126,8 @@ _PLE_LAYER: dict[str, tuple[str, str]] = {
 # Parts of a merged projection: combined by the weight iterator, which is the only place
 # that knows the concat order, so they are never renamed 1:1.
 #
-#   self_attn.qkv_proj             <- attn_q (queries AND gate), attn_k, attn_v
+#   self_attn.qkv_proj             <- attn_q (queries AND gate, interleaved per head),
+#                                     attn_k, attn_v
 #   linear_attn.in_proj            <- attn_qkv, attn_gate, ssm_beta, ssm_alpha
 #   mlp.shared_expert.gate_up_proj <- ffn_gate_shexp, ffn_up_shexp
 _MERGED_PARTS: frozenset[str] = frozenset({

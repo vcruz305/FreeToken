@@ -44,14 +44,16 @@ def grouped_rms_norm(
     """
     T, streams, D = x.shape
     assert streams == hc, f"expected {hc} streams, got {streams}"
-    # Accumulate in at least float32 -- a bf16 sum of squares over 2560 channels loses
-    # enough to matter -- but do not force float64 inputs down to float32, or a
-    # double-precision comparison against a reference silently becomes a float32 one.
+    # Accumulate the reduction in at least float32 -- a 16-bit sum of squares over 2560
+    # channels loses enough to matter -- but do NOT promote the whole state to do it. This
+    # runs 96 times per forward on a [T, hc, D] tensor, and at 8192 prefill tokens a
+    # float32 copy is 336 MB a call, which is what exhausted the device at long context.
+    # Only the [T, hc, 1] variance needs the wider type. float64 input keeps float64 so a
+    # double-precision comparison against a reference does not silently become float32.
     acc = x.dtype if x.dtype in (torch.float32, torch.float64) else torch.float32
-    xa = x.to(acc)
-    var = xa.pow(2).mean(dim=-1, keepdim=True)
-    xn = (xa * torch.rsqrt(var + eps)).reshape(T, hc * D)
-    return (xn * weight.to(acc)).to(x.dtype)
+    var = x.pow(2).sum(dim=-1, keepdim=True, dtype=acc) / D
+    xn = (x * torch.rsqrt(var + eps).to(x.dtype)).reshape(T, hc * D)
+    return xn * weight.to(x.dtype)
 
 
 def hc_mix(

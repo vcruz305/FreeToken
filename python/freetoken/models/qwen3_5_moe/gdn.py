@@ -227,6 +227,13 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         out = self.norm.forward(core_out, z).reshape(total, -1)
+        # Project in the projection's own dtype. The recurrence and the gated norm may
+        # accumulate wider than the model dtype, and letting that reach out_proj both
+        # mismatches an fp16 weight and would pick a slower kernel than asked for. A no-op
+        # when they already agree, which is every bf16 checkpoint.
+        w = getattr(self.out_proj, "weight", None)
+        if w is not None and w.dtype.is_floating_point and out.dtype != w.dtype:
+            out = out.to(w.dtype)
         return self.out_proj.forward(out)
 
 

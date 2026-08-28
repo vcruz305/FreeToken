@@ -185,8 +185,13 @@ class Qwen4ExpModel(BaseOP):
         return self.ple.gather(torch.from_numpy(rows), input_ids.device)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # The wide residual starts as hc identical copies of the embedding.
+        # The wide residual starts as hc identical copies of the embedding, in the dtype
+        # the loaded weights actually have. Reading it off a real parameter here rather than
+        # from a construction-time default means the residual cannot drift into a wider
+        # dtype than the projections it feeds -- which both mismatches them and, on Turing,
+        # would pick a GEMM path 12-22x slower than the one asked for.
         state = hc_init(self.embed_tokens.forward(input_ids), self.hc)
+        state = state.to(self.hc_head.norm.dtype)
 
         # Normally the PLE embedding arrives as a graph input, gathered on the host before
         # the capture boundary (see Qwen4ExpForCausalLM.prepare_host_inputs). Warmup and

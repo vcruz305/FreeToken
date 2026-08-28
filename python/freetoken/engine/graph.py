@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import gc
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
@@ -28,10 +28,25 @@ class GraphCaptureBuffer:
     table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
     # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
     fla_cu_seqlens: torch.Tensor
+    # Host-produced per-step model inputs, keyed by name. Bound at capture and refilled by
+    # copy_from on every replay, which runs outside the captured region.
+    host_inputs: dict = field(default_factory=dict)
 
     @classmethod
-    def init(cls, bs: int, vocab_size: int, device: torch.device) -> GraphCaptureBuffer:
+    def init(
+        cls,
+        bs: int,
+        vocab_size: int,
+        device: torch.device,
+        host_input_spec: dict | None = None,
+    ) -> GraphCaptureBuffer:
+        """``host_input_spec`` maps a name to ``(width, dtype)``; each becomes a persistent
+        ``[bs, width]`` buffer the captured graph reads and ``copy_from`` refills."""
         return GraphCaptureBuffer(
+            host_inputs={
+                name: torch.zeros(bs, width, dtype=dtype, device=device)
+                for name, (width, dtype) in (host_input_spec or {}).items()
+            },
             input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
             out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
             positions=torch.zeros(bs, dtype=torch.int32, device=device),
@@ -54,6 +69,8 @@ class GraphCaptureBuffer:
         batch.fla_metadata = FLAMetadata(
             cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[_slice]
         )
+        if self.host_inputs:
+            batch.host_inputs = {k: v[_slice] for k, v in self.host_inputs.items()}
 
     def copy_from(self, batch: Batch) -> None:
         _slice = slice(batch.padded_size)
@@ -63,6 +80,12 @@ class GraphCaptureBuffer:
         self.positions[_slice] = batch.positions
         if batch.linear_table_idx is not None:
             self.table_idx[_slice] = batch.linear_table_idx
+        # Refill the host-produced inputs the captured graph reads. This runs on replay,
+        # outside the capture, which is the whole point of routing them through here.
+        for name, buf in self.host_inputs.items():
+            src = (batch.host_inputs or {}).get(name)
+            if src is not None:
+                buf[_slice] = src
 
 
 def _determine_cuda_graph_bs(
@@ -145,7 +168,12 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
-        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device)
+        # A model may need per-step inputs that can only be produced on the host; it
+        # declares their shapes here so they become persistent graph inputs.
+        spec = getattr(model, "host_input_spec", None)
+        self.buffer = GraphCaptureBuffer.init(
+            self.max_graph_bs, vocab_size, self.device, spec() if spec else None
+        )
         self._reset_moe_offload_cache()
 
         pbar = tqdm(

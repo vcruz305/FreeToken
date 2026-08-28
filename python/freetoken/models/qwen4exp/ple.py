@@ -228,7 +228,7 @@ class Qwen4ExpPLE(BaseOP):
                 return
         raise ValueError("qwen4exp: per_layer_token_embd.weight not found")
 
-    def _gather(self, rows: torch.Tensor, device) -> torch.Tensor:
+    def gather(self, rows: torch.Tensor, device) -> torch.Tensor:
         """Gather the hashed rows on the host, then dequantise them on the device.
 
         Only the gathered bytes cross the bus: 16 rows of 90 packed bytes per token.
@@ -236,22 +236,32 @@ class Qwen4ExpPLE(BaseOP):
         from freetoken.kernel.gguf import ggml_dequantize
 
         assert self._table is not None, "bind_table() must run before the first forward"
+        n_tokens = rows.shape[0]
         idx = rows.reshape(-1).to("cpu", torch.int64)
         packed = self._table.index_select(0, idx).to(device, non_blocking=True)
-        return ggml_dequantize(
+        flat = ggml_dequantize(
             packed, self._table_type, packed.shape[0], self.head_dim, torch.bfloat16
         )
+        # get_rows lays the head dimension out slowest, so the heads of one token are
+        # adjacent rows; flatten them into that token's single [n_heads*head_dim] vector,
+        # which is what the key/value projections consume.
+        return flat.reshape(n_tokens, self.n_heads * self.head_dim)
 
     def forward(
         self,
         state: torch.Tensor,
-        rows: torch.Tensor,
+        emb: torch.Tensor,
         *,
         history: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """``state`` [T, hc, D]; ``rows`` [T, n_heads] int32 row indices from the hash."""
+        """``state`` [T, hc, D]; ``emb`` [T, n_heads*head_dim] gathered on the host.
+
+        The gather is not done here because it reads a 28.8 GB host-resident table, which
+        a captured CUDA graph cannot contain. It happens in prepare_host_inputs and arrives
+        through a persistent graph-input buffer.
+        """
         T = state.shape[0]
-        emb = self._gather(rows, state.device).reshape(T, self.n_heads * self.head_dim)
+        emb = emb[:T].reshape(T, self.n_heads * self.head_dim)
 
         key = grouped_rms_norm(
             self.key.forward(emb).reshape(T, self.hc, self.hidden_size),

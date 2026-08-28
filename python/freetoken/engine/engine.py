@@ -923,6 +923,11 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        # Anything the model must compute on the host runs here, before the capture
+        # boundary: a captured graph cannot contain host work or an unpinned H2D copy.
+        prepare = getattr(self.model, "prepare_host_inputs", None)
+        if prepare is not None:
+            prepare(batch)
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)

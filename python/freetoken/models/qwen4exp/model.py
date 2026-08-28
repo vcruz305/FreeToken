@@ -157,22 +157,22 @@ class Qwen4ExpModel(BaseOP):
             injects=False,
         )
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def _gather_inline(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Hash and gather straight from the batch's token ids.
+
+        Used only off the captured path. The window here comes from the batch alone, so a
+        continuation chunk would see fewer predecessors than it should -- acceptable for
+        warmup, which is why the real path routes through prepare_host_inputs instead.
+        """
         from .ple import ple_rows
 
-        # The wide residual starts as hc identical copies of the embedding.
-        state = hc_init(self.embed_tokens.forward(input_ids), self.hc)
-
-        # The hash needs each token's predecessors. A fresh single-sequence prefill has
-        # them all in this batch, and positions before the start read as EOS. Decode and
-        # chunked prefill need the preceding tokens from the KV cells and a conv history,
-        # which is not wired yet -- refuse rather than quietly hash the wrong window.
-        ctx = get_global_ctx()
-        toks = input_ids.tolist()
         g = self.geo
+        toks = input_ids.tolist()
         n_prev = g["ple_ngram_size"] - 1
-        preds = [[toks[i - s] if i - s >= 0 else None for s in range(n_prev, 0, -1)]
-                 for i in range(len(toks))]
+        preds = [
+            [toks[i - s] if i - s >= 0 else None for s in range(n_prev, 0, -1)]
+            for i in range(len(toks))
+        ]
         rows = ple_rows(
             toks, preds,
             multipliers=list(g["ple_head_multipliers"]),
@@ -182,11 +182,25 @@ class Qwen4ExpModel(BaseOP):
             heads_per_ngram=g["ple_heads_per_ngram"],
             eos_token_id=g["ple_eos_token_id"],
         )
-        rows_t = torch.from_numpy(rows).to(input_ids.device, torch.int32)
+        return self.ple.gather(torch.from_numpy(rows), input_ids.device)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # The wide residual starts as hc identical copies of the embedding.
+        state = hc_init(self.embed_tokens.forward(input_ids), self.hc)
+
+        # Normally the PLE embedding arrives as a graph input, gathered on the host before
+        # the capture boundary (see Qwen4ExpForCausalLM.prepare_host_inputs). Warmup and
+        # any other path that calls the model directly has no such buffer; those are never
+        # captured, so falling back to an inline gather there is safe. Only a captured
+        # graph cannot contain the host work.
+        host = get_global_ctx().batch.host_inputs or {}
+        ple_emb = host.get("ple_emb")
+        if ple_emb is None:
+            ple_emb = self._gather_inline(input_ids)
 
         for i, layer in enumerate(self.layers.op_list):
             if i in self.ple_layers:
-                state = self.ple.forward(state, rows_t, history=None)
+                state = self.ple.forward(state, ple_emb, history=None)
             state = layer.forward(state)
         mixed, _ = self.hc_head.mix(state)
         return mixed
@@ -201,6 +215,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             "geometry is read from the checkpoint"
         )
         geo = geometry_from_path(config.gguf_model_path)
+        self._hidden_size = config.hidden_size
+        self._device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         self.model = Qwen4ExpModel(config, geo)
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
@@ -214,6 +230,53 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
         convert_qwen4exp_to_gguf(self, config, model_path=config.gguf_model_path)
         self.model.ple.bind_table(config.gguf_model_path)
+
+    def host_input_spec(self) -> dict:
+        """The PLE embedding is a graph input, not host work inside the capture.
+
+        Its table is 28.8 GB and stays on the host, but the gathered rows depend only on
+        the token ids -- not on any hidden state -- so they can be produced before the
+        forward and read from a persistent buffer, which is exactly how llama.cpp treats
+        the hashed rows. Without this a captured graph would contain an unpinned H2D copy
+        and capture fails.
+        """
+        return {"ple_emb": (self._hidden_size, torch.bfloat16)}
+
+    def prepare_host_inputs(self, batch) -> None:
+        """Hash each position's n-gram window and gather its PLE rows.
+
+        The window comes from the request's own token history, so a decode step and a
+        chunked prefill see the same predecessors a single-shot prefill would. Positions
+        before the start of the sequence read as EOS, as in the reference.
+        """
+        from .ple import ple_rows
+
+        g = self.model.geo
+        n_prev = g["ple_ngram_size"] - 1
+        toks, preds = [], []
+        for req in batch.reqs:
+            ids = req.input_ids.tolist()
+            for pos in range(req.cached_len, req.device_len):
+                if pos >= len(ids):
+                    break
+                toks.append(ids[pos])
+                preds.append(
+                    [ids[pos - s] if pos - s >= 0 else None for s in range(n_prev, 0, -1)]
+                )
+        if not toks:
+            return
+        rows = ple_rows(
+            toks, preds,
+            multipliers=list(g["ple_head_multipliers"]),
+            head_offsets=list(g["ple_head_offsets"]),
+            head_vocab_sizes=list(g["ple_head_vocab_sizes"]),
+            ngram_size=g["ple_ngram_size"],
+            heads_per_ngram=g["ple_heads_per_ngram"],
+            eos_token_id=g["ple_eos_token_id"],
+        )
+        emb = self.model.ple.gather(torch.from_numpy(rows), self._device)
+        batch.host_inputs = dict(batch.host_inputs or {})
+        batch.host_inputs["ple_emb"] = emb
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)

@@ -135,6 +135,12 @@ class Batch:
     attn_metadata: BaseAttnMetadata = field(init=False)
     # concatenated multimodal soft-token embeddings for a prefill batch (or None)
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
+    # Per-step model input that has to be produced on the host and therefore cannot
+    # live inside a captured graph. qwen4exp's PLE embedding is the case: its table is
+    # 28.8 GB and stays host-resident, but the gathered rows depend only on the token
+    # ids, so they are computed before the forward and copied into a persistent buffer,
+    # exactly as llama.cpp makes the hashed rows a graph input.
+    host_inputs: dict | None = field(default=None, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()
     # advances cached_len), so the prefill log reports the tokens actually forwarded and
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the

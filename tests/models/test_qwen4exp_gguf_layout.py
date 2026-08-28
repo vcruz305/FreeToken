@@ -85,11 +85,13 @@ KV = {
 
 
 class _Shim:
-    def __init__(self, kv):
-        self._kv = kv
+    """Enough of GgufConfigShim for the geometry reader: it looks up
+    ``metadata[f"{model_type}.{key}"]``."""
 
-    def get(self, key, default=None):
-        return self._kv.get(key, default)
+    def __init__(self, kv):
+        self.metadata = kv
+        self.model_type = "qwen4exp"
+        self.model_path = "<test>"
 
 
 def test_every_tensor_in_the_file_is_placed(real_names):

@@ -353,6 +353,12 @@ class Engine:
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
+        # A model may keep its own per-KV-cell store (qwen4exp's indexer keeps one raw key
+        # per cell). Size it here, where the cell count is first known, so it is indexed by
+        # the same out_loc the KV is written at.
+        bind_kv = getattr(self.model, "bind_kv_geometry", None)
+        if bind_kv is not None:
+            bind_kv(num_tokens, self.device, self.dtype)
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()

@@ -354,23 +354,23 @@ def parse_gguf_geometry(shim: "GgufConfigShim") -> dict[str, Any]:
         "indexer_heads": int(_kv(shim, "attention.indexer.head_count")),
         "indexer_key_length": int(_kv(shim, "attention.indexer.key_length")),
         "indexer_top_k": int(_kv(shim, "attention.indexer.top_k")),
-        "ple_layers": tuple(int(x) for x in (_kv(shim, "ple.layers") or ())),
+        "ple_layers": tuple(int(x) for x in (_kv(shim, "ple.layers", ()) or ())),
         "ple_ngram_size": int(_kv(shim, "ple.ngram_size", 0)),
         "ple_heads_per_ngram": int(_kv(shim, "ple.heads_per_ngram", 0)),
         "ple_input_dim": int(_kv(shim, "embedding_length_per_layer_input", 0)),
-        "ple_head_offsets": tuple(int(x) for x in (_kv(shim, "ple.head_offsets") or ())),
+        "ple_head_offsets": tuple(int(x) for x in (_kv(shim, "ple.head_offsets", ()) or ())),
         "ple_head_vocab_sizes": tuple(
-            int(x) for x in (_kv(shim, "ple.head_vocab_sizes") or ())
+            int(x) for x in (_kv(shim, "ple.head_vocab_sizes", ()) or ())
         ),
         "ple_head_multipliers": tuple(
-            int(x) for x in (_kv(shim, "ple.layer_multipliers") or ())
+            int(x) for x in (_kv(shim, "ple.layer_multipliers", ()) or ())
         ),
         "ple_conv_kernel": int(_kv(shim, "ple.conv_kernel", 0)),
         # The image token stands in when a position carries no text token; the reference
         # falls back to EOS for files written before that key existed.
         "ple_eos_token_id": int(_kv(shim, "ple.eos_token_id", 0)),
         "ple_image_token_id": int(_kv(shim, "ple.image_token_id", 0)),
-        "rope_dimension_sections": tuple(_kv(shim, "rope.dimension_sections") or ()),
+        "rope_dimension_sections": tuple(_kv(shim, "rope.dimension_sections", ()) or ()),
         "rope_freq_base": float(_kv(shim, "rope.freq_base", 0.0)),
         "context_length": int(_kv(shim, "context_length", 0)),
     }
@@ -727,6 +727,20 @@ def iter_gguf_weights(
         if suffix in _EXPERT_SUFFIXES:
             continue
         if suffix.startswith("indexer."):
+            if layer not in full_ids:
+                raise Qwen4ExpLayoutError(
+                    f"qwen4exp GGUF: indexer tensor {name!r} on a non-full-attention layer"
+                )
+            part = suffix[len("indexer.") :].replace(".weight", "")
+            dest = {
+                "q_proj": "self_attn.index_q_proj.weight",
+                "k_proj": "self_attn.index_k_proj.weight",
+                "q_norm": "self_attn.index_q_norm.weight",
+                "k_norm": "self_attn.index_k_norm.weight",
+            }.get(part)
+            if dest is None:
+                raise Qwen4ExpLayoutError(f"qwen4exp GGUF: unmapped indexer tensor {name!r}")
+            yield f"{base}.{dest}", _to_bf16(t)
             skipped_indexer += 1
             continue
 
@@ -889,8 +903,9 @@ def iter_gguf_weights(
         from freetoken.utils import init_logger
 
         init_logger(__name__).info_rank0(
-            f"qwen4exp: skipped {skipped_indexer} indexer tensors; attention runs dense, "
-            f"which is exact below indexer_top_k ({geo['indexer_top_k']}) tokens"
+            f"qwen4exp: loaded {skipped_indexer} indexer tensors; key selection is "
+            f"{'on' if __import__('os').environ.get('FREETOKEN_QWEN4EXP_INDEXER') == '1' else 'off'} "
+            f"(dense attention is exact below indexer_top_k {geo['indexer_top_k']})"
         )
 
 

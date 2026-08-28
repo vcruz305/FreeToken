@@ -35,11 +35,11 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
-from freetoken.models.qwen3_5_moe.attention import Qwen3_5Attention
 from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
 from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
 from freetoken.utils import nvtx_annotate
 
+from .attention import Qwen4ExpAttention
 from .hyper_connections import hc_combine, hc_init, hc_mix
 
 if TYPE_CHECKING:
@@ -100,7 +100,7 @@ class Qwen4ExpDecoderLayer(BaseOP):
                 gate_activation="sigmoid",
             )
         else:
-            self.self_attn = Qwen3_5Attention(config, layer_id)
+            self.self_attn = Qwen4ExpAttention(config, layer_id, geo)
 
         self.mlp = Qwen3_5MoE(config, layer_id)
         self.hc_attn = HyperConnection(
@@ -271,6 +271,19 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         keyed exactly as the GDN's is and a request's two histories cannot drift apart.
         """
         self.model.ple.init_conv_state(num_slots, device, dtype)
+
+    def bind_kv_geometry(self, num_cells: int, device, dtype) -> None:
+        """Size the indexer's raw-key store, one row per KV cell.
+
+        Indexed by the same ``out_loc`` the KV is written at, so a reused cell is
+        overwritten before it can be read and a stale key can never score the wrong token.
+        """
+        from .attention import Qwen4ExpAttention
+
+        for layer in self.model.layers.op_list:
+            attn = getattr(layer, "self_attn", None)
+            if isinstance(attn, Qwen4ExpAttention):
+                attn.bind_index_cache(num_cells, device, dtype)
 
     def host_input_spec(self) -> dict:
         """The PLE embedding is a graph input, not host work inside the capture.

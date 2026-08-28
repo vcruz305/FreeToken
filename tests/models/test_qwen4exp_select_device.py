@@ -75,6 +75,53 @@ def test_reference_respects_the_budget():
     assert got.numel() <= 12
 
 
-@pytest.mark.skipif(True, reason="device implementation not landed yet")
-def test_device_matches_reference():
-    """Enable once select_cells_device exists; this is its acceptance test."""
+@pytest.mark.parametrize(
+    "lens,budget",
+    [([12, 8], 64), ([13], 8), ([40], 12), ([40, 24, 13], 12), ([4], 8), ([7], 4),
+     ([2048, 2048], 260), ([100, 5, 63], 20)],
+)
+def test_device_matches_reference(lens, budget):
+    """The acceptance test: same selection as the host loop, on every shape."""
+    from freetoken.models.qwen4exp.select_device import select_cells_device
+
+    indptr, indices, scores, n_blocks = _case(lens, seed=len(lens) + budget)
+    want = ref_select(indptr, indices, scores, n_blocks,
+                      compress_ratio=RATIO, budget=budget)
+    cap = max(budget, max(lens))
+    got_ptr, got_idx = select_cells_device(
+        indptr, indices, scores, n_blocks,
+        compress_ratio=RATIO, budget=budget, capacity=cap,
+    )
+    for i in range(len(lens)):
+        g = got_idx[int(got_ptr[i]) : int(got_ptr[i + 1])]
+        torch.testing.assert_close(g.sort().values, want[i].sort().values)
+
+
+def test_output_shapes_do_not_depend_on_the_data():
+    """The whole point: a captured graph cannot hold a data-dependent allocation.
+
+    Two very different selections must produce identically shaped buffers.
+    """
+    from freetoken.models.qwen4exp.select_device import select_cells_device
+
+    a = _case([40, 40], seed=1)
+    b = _case([40, 40], seed=2)
+    shapes = []
+    for indptr, indices, scores, n_blocks in (a, b):
+        ptr, idx = select_cells_device(indptr, indices, scores, n_blocks,
+                                       compress_ratio=RATIO, budget=12, capacity=40)
+        shapes.append((tuple(ptr.shape), tuple(idx.shape)))
+    assert shapes[0] == shapes[1] == ((3,), (80,))
+
+
+def test_unkept_cells_are_not_addressable():
+    """Cells outside a request's indptr span must never be attended, whatever is in the
+    padding."""
+    from freetoken.models.qwen4exp.select_device import select_cells_device
+
+    indptr, indices, scores, n_blocks = _case([40], seed=3)
+    ptr, idx = select_cells_device(indptr, indices, scores, n_blocks,
+                                   compress_ratio=RATIO, budget=12, capacity=40)
+    kept = idx[int(ptr[0]) : int(ptr[1])]
+    assert kept.numel() <= 12
+    assert kept.unique().numel() == kept.numel(), "a cell must not be attended twice"

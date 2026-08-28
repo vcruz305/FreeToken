@@ -44,15 +44,18 @@ def _kv(shim: "GgufConfigShim", key: str, default: Any = None) -> Any:
     return val
 
 
-def _uniform_expert_types(model_path: str, num_layers: int) -> tuple[int, int] | None:
-    """``(gate_up, down)`` ggml types of the routed-expert banks, or None if not uniform.
+def _expert_types_per_layer(
+    model_path: str, num_layers: int
+) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    """``(gate_up, down)`` ggml types of the routed-expert banks, one entry per layer.
 
-    The offload slot pool is one allocation per bank shared by every layer, and
-    ``moe_vec.cuh`` addresses it as ``expert * nrows * (ncols / qk)`` with no padding
-    allowance -- so a bank whose type varies by layer cannot be served. We return None
-    rather than raising here because ``parse_gguf_config`` also runs for metadata-only
-    inspection; ``expert_banks._gguf_banks`` is where the load actually fails, with the
-    offending layers named. (llama.cpp's *_M mixes hit this.)
+    Per-layer rather than a single type per bank: llama.cpp's dynamic quants raise the
+    precision of a few layers, and the slot pool now pads its rows to the widest type
+    present and strides by it, so a mixed bank is servable. The MoE forward passes the
+    type belonging to the layer it is running.
+
+    Returns None only when the file cannot be read -- ``parse_gguf_config`` also runs for
+    metadata-only inspection, so a failure here must not raise.
     """
     from .gguf_experts import gguf_expert_types
 
@@ -60,10 +63,7 @@ def _uniform_expert_types(model_path: str, num_layers: int) -> tuple[int, int] |
         types = gguf_expert_types(model_path, num_layers)
     except Exception:
         return None
-    gate_up, down = set(types["gate_up"]), set(types["down"])
-    if len(gate_up) != 1 or len(down) != 1:
-        return None
-    return (next(iter(gate_up)), next(iter(down)))
+    return (tuple(int(t) for t in types["gate_up"]), tuple(int(t) for t in types["down"]))
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
@@ -136,7 +136,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         attention_groups=groups,
         expert_quant="gguf" if moe_enabled else "none",
         gguf_expert_types=(
-            _uniform_expert_types(shim.model_path, num_layers) if moe_enabled else None
+            _expert_types_per_layer(shim.model_path, num_layers) if moe_enabled else None
         ),
         gguf_model_path=shim.model_path,
         weight_block_size=None,

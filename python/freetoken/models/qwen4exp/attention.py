@@ -18,21 +18,13 @@ Selection is decode-only: ``indptr`` is per-request, so it cannot express a diff
 set for each query of a multi-query request. Prefill stays dense, which is exact below the
 budget anyway.
 
-Off unless ``FREETOKEN_QWEN4EXP_INDEXER=1``, and it currently requires
-``--cuda-graph-max-bs 0``. The selection reads per-request lengths on the host and builds
-the filtered list there, which a captured graph cannot contain. Making it capturable means
-doing the whole selection on device with static shapes -- MiniMax-M3's block-sparse backend
-shows the shape of that (per-request block rows and live lengths staged into persistent
-buffers, device-read lengths, shape-fixed grids) and is the template for finishing it.
+Selection runs entirely on device with static shapes (``select_device.py``), so CUDA
+graphs are unaffected -- which matters, since graphs are a measured 2.35x here.
 
-That constraint matters for whether this is worth switching on: CUDA graphs are a measured
-2.35x here, so until the selection is capturable the indexer costs more than it saves at
-short context. It earns its keep only above ``indexer_top_k``, where dense attention stops
-matching what the model was trained on.
-
-The scoring is verified against the reference (``indexer.py``,
-``tests/models/test_qwen4exp_indexer.py``); the end-to-end long-context path is not yet
-validated, which is why this is opt-in.
+Off unless ``FREETOKEN_QWEN4EXP_INDEXER=1``. The scoring and the selection are each
+verified against the reference (``tests/models/test_qwen4exp_indexer.py``,
+``test_qwen4exp_select_device.py``), but the end-to-end path has not been checked above
+``indexer_top_k`` on real weights, which is the only regime where it changes anything.
 """
 
 from __future__ import annotations
@@ -47,7 +39,8 @@ from freetoken.layers import GemmaRMSNorm, LinearReplicated
 from freetoken.models.qwen3_5_moe.attention import Qwen3_5Attention
 from freetoken.utils import nvtx_annotate
 
-from .indexer import block_positions, block_scores, pool_blocks
+from .indexer import block_positions
+from .select_device import select_cells_device
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -71,8 +64,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             from freetoken.utils import init_logger
 
             init_logger(__name__).info_rank0(
-                "qwen4exp: lightning indexer ENABLED. Requires --cuda-graph-max-bs 0: the "
-                "selection runs on the host and cannot live inside a captured graph."
+                "qwen4exp: lightning indexer ENABLED (device-side selection, CUDA-graph "
+                "safe). Below indexer_top_k it selects every key, so short contexts are "
+                "unchanged."
             )
 
         # BF16 dense in the checkpoint (indexer.q_proj / k_proj), not block-quantised.
@@ -82,6 +76,18 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         self.index_k_proj = LinearReplicated(config.hidden_size, self.idx_dim, has_bias=False)
         self.index_q_norm = GemmaRMSNorm(self.idx_dim, eps=config.rms_norm_eps)
         self.index_k_norm = GemmaRMSNorm(self.idx_dim, eps=config.rms_norm_eps)
+        # The indexer's own rope. self.rotary is built for the attention head_dim (256);
+        # indexer vectors are indexer_key_length (128) wide, and reusing the attention
+        # instance reshapes them by the wrong head size.
+        from freetoken.layers.rotary import get_rope
+
+        self.index_rotary = get_rope(
+            head_dim=self.idx_dim,
+            rotary_dim=min(config.rotary_config.rotary_dim, self.idx_dim),
+            max_position=config.rotary_config.max_position,
+            base=config.rotary_config.base,
+            rope_scaling=None,
+        )
         # Raw keys, one per KV cell. Bound by the model once the cache geometry is known.
         self.index_k_cache: torch.Tensor | None = None
 
@@ -89,43 +95,53 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         self.index_k_cache = torch.zeros(num_cells, self.idx_dim, device=device, dtype=dtype)
 
     def _select(self, index_q: torch.Tensor, batch) -> AttentionSpec | None:
-        """Filtered ``(indptr, indices)`` for this decode step, or None to stay dense."""
+        """Filtered ``(indptr, indices)`` for this decode step.
+
+        Fully vectorised over the batch and free of data-dependent shapes, so it can run
+        inside a captured graph. Requests are padded to one common width; padding is masked
+        out of the block scores and never selected.
+        """
         md = batch.attn_metadata
         indptr, indices = md.indptr, md.indices
         bs = indptr.numel() - 1
-        lens = (indptr[1:] - indptr[:-1]).tolist()
-        budget = self.idx_top_k + self.compress_ratio - 1
-        if min(lens) < budget:
-            # Under the budget somewhere: selection would be the identity for that request
-            # and the widths would differ across the batch. Dense is exact here.
+        r = self.compress_ratio
+
+        lens = (indptr[1:] - indptr[:-1]).to(torch.int32)
+        width = int(indices.numel() // max(bs, 1))
+        width = (width // r) * r
+        if width < r:
             return None
 
-        keep_ptr = [0]
-        keep = []
-        for i, n_kv in enumerate(lens):
-            cells = indices[indptr[i] : indptr[i] + n_kv]
-            n_blocks = n_kv // self.compress_ratio
-            tail = cells[n_blocks * self.compress_ratio :]
+        # [bs, width] cells, padded. Out-of-range reads are clamped and then masked.
+        pos = torch.arange(width, device=indices.device)
+        flat = (indptr[:-1].unsqueeze(1) + pos.unsqueeze(0)).clamp(max=indices.numel() - 1)
+        cells = indices.reshape(-1)[flat.long()]                      # [bs, width]
+        live = pos.unsqueeze(0) < lens.unsqueeze(1)
 
-            raw = self.index_k_cache.index_select(0, cells[: n_blocks * self.compress_ratio].long())
-            pooled = pool_blocks(raw, self.compress_ratio)
-            pos = block_positions(n_blocks, self.compress_ratio, device=pooled.device)
-            pooled = self.index_k_norm.forward(pooled)
-            pooled, _ = self.rotary.forward(pos.to(torch.int32), pooled, pooled.clone())
+        n_blocks = (lens // r).to(torch.int32)
+        max_blocks = width // r
 
-            scores = block_scores(index_q[i : i + 1], pooled)[0]      # [n_blocks]
-            take = min(n_blocks, (budget - tail.numel()) // self.compress_ratio)
-            top = scores.topk(take).indices
-            # every cell of a chosen block, plus the ragged tail which is never scored
-            offs = torch.arange(self.compress_ratio, device=cells.device)
-            chosen = (top.unsqueeze(1) * self.compress_ratio + offs).reshape(-1)
-            keep.append(torch.cat([cells.index_select(0, chosen), tail]))
-            keep_ptr.append(keep_ptr[-1] + keep[-1].numel())
+        raw = self.index_k_cache.index_select(0, cells.reshape(-1).long())
+        raw = raw.view(bs, max_blocks, r, self.idx_dim)
+        pooled = raw.mean(dim=2)                                      # [bs, max_blocks, d]
 
-        return AttentionSpec(
-            kv_indptr=torch.tensor(keep_ptr, device=indices.device, dtype=torch.int32),
-            kv_indices=torch.cat(keep).to(torch.int32),
+        blk_pos = block_positions(max_blocks, r, device=pooled.device).to(torch.int32)
+        pooled = self.index_k_norm.forward(pooled)
+        flat_p = pooled.reshape(bs * max_blocks, self.idx_dim)
+        rot_pos = blk_pos.repeat(bs)
+        flat_p, _ = self.index_rotary.forward(rot_pos, flat_p, flat_p.clone())
+        pooled = flat_p.view(bs, max_blocks, self.idx_dim)
+
+        # relu per head, then sum over heads -- the order the reference specifies.
+        per_head = torch.einsum("bhd,bkd->bkh", index_q, pooled)
+        scores = torch.relu(per_head).sum(dim=-1)                     # [bs, max_blocks]
+
+        budget = self.idx_top_k + r - 1
+        out_ptr, out_idx = select_cells_device(
+            indptr.to(torch.int32), indices.to(torch.int32), scores, n_blocks,
+            compress_ratio=r, budget=budget, capacity=width,
         )
+        return AttentionSpec(kv_indptr=out_ptr, kv_indices=out_idx)
 
     @nvtx_annotate("MHA_QSA")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -134,13 +150,6 @@ class Qwen4ExpAttention(Qwen3_5Attention):
 
         spec = None
         if self._enabled and self.index_k_cache is not None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "qwen4exp lightning indexer cannot be CUDA-graph captured: its "
-                    "selection reads per-request lengths on the host. Serve with "
-                    "--cuda-graph-max-bs 0, or finish the device-side selection "
-                    "(see attention/m3_sparse.py for the capturable pattern)."
-                )
             # Raw: pooling precedes norm and rope, so neither is applied before caching.
             raw_k = self.index_k_proj.forward(x)
             self.index_k_cache[ctx.batch.out_loc] = raw_k.to(self.index_k_cache.dtype)
@@ -148,7 +157,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 iq = self.index_q_proj.forward(x).view(-1, self.idx_heads, self.idx_dim)
                 iq = self.index_q_norm.forward(iq)
                 flat = iq.reshape(-1, self.idx_heads * self.idx_dim)
-                flat, _ = self.rotary.forward(ctx.batch.positions, flat, flat.clone())
+                flat, _ = self.index_rotary.forward(
+                    ctx.batch.positions, flat, flat.clone()
+                )
                 spec = self._select(flat.view(-1, self.idx_heads, self.idx_dim), ctx.batch)
 
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch, spec)

@@ -577,8 +577,13 @@ def convert_qwen4exp_to_gguf(model, config, *, model_path: str) -> None:
             )
         return types[key]
 
+    # Read the compute dtype off a tensor the engine allocated under its own
+    # torch_dtype(config.dtype) context, rather than trusting the ambient default here.
+    mdtype = model.model.hc_head.norm.dtype
     gt = types[(-1, "token_embd.weight")]
-    model.model.embed_tokens = GGUFEmbedding(config.vocab_size, H, quant_type=gt)
+    model.model.embed_tokens = GGUFEmbedding(
+        config.vocab_size, H, quant_type=gt, dtype=mdtype
+    )
     if not config.tie_word_embeddings:
         # Untied: slice to the last prefill position before the projection, or a long
         # prompt materialises [prompt_len, vocab] logits for no reason.

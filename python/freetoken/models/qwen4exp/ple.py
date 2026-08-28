@@ -205,6 +205,8 @@ class Qwen4ExpPLE(BaseOP):
         # indexed per token, so the 28.8 GB never has to fit anywhere.
         self._table_rows = table_rows
         self._table_type = quant_types["table"]
+        # Matches the norms allocated just below, which the engine sized under its dtype.
+
         self._table = None  # bound by bind_table()
         self.key = GGUFLinear(gathered, width, quant_type=quant_types["key"])
         self.value = GGUFLinear(gathered, hidden_size, quant_type=quant_types["value"])
@@ -213,6 +215,8 @@ class Qwen4ExpPLE(BaseOP):
         self.norm_conv = torch.empty(width)
         # [channels, taps]: the reader reverses ggml's fastest-first dims.
         self.conv1d = torch.empty(width, self.conv_kernel)
+        # The compute dtype, taken from a tensor allocated under the engine's context.
+        self._dtype = self.norm_key.dtype
 
     def bind_table(self, model_path: str) -> None:
         """Point at the packed PLE table without copying it.
@@ -240,7 +244,7 @@ class Qwen4ExpPLE(BaseOP):
         idx = rows.reshape(-1).to("cpu", torch.int64)
         packed = self._table.index_select(0, idx).to(device, non_blocking=True)
         flat = ggml_dequantize(
-            packed, self._table_type, packed.shape[0], self.head_dim, torch.bfloat16
+            packed, self._table_type, packed.shape[0], self.head_dim, self._dtype
         )
         # get_rows lays the head dimension out slowest, so the heads of one token are
         # adjacent rows; flatten them into that token's single [n_heads*head_dim] vector,

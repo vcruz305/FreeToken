@@ -265,10 +265,17 @@ class GGUFEmbedding(BaseOP):
         embedding_dim: int,
         quant_type: int,
         embed_scale: float | None = None,
+        dtype: torch.dtype | None = None,
     ):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self._quant_type = quant_type
+        # The compute dtype. Hardcoding bf16 here silently forced the whole model back to
+        # bf16 whatever --dtype asked for, which matters on Turing: sm_75 has no bf16 tensor
+        # cores, and a batched bf16 GEMM measures 12-22x slower than fp16 on a Quadro RTX
+        # 6000. Callers should pass it explicitly rather than leaning on the ambient default,
+        # which is only the model dtype while the engine's construction context is open.
+        self._dtype = dtype if dtype is not None else torch.get_default_dtype()
         self.qweight = torch.empty(
             num_embeddings, row_bytes(embedding_dim, quant_type), dtype=torch.uint8
         )
@@ -283,9 +290,11 @@ class GGUFEmbedding(BaseOP):
         if self._quant_type in GGML_UNQUANTIZED:
             # Raw value bytes, not blocks: there is no dequant kernel for the unquantized
             # types (ggml_dequantize rejects type 1), so reinterpret the gathered rows.
-            y = rows.view(_UNQUANTIZED_DTYPE[self._quant_type]).to(torch.bfloat16)
+            y = rows.view(_UNQUANTIZED_DTYPE[self._quant_type]).to(self._dtype)
         else:
-            y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim, torch.bfloat16)
+            y = ggml_dequantize(
+                rows, self._quant_type, flat.shape[0], self.embedding_dim, self._dtype
+            )
         y = y.view(*x.shape, self.embedding_dim)
         if self._embed_scale is not None:
             if self._embed_scale_t is None:

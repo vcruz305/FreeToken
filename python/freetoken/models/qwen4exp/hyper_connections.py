@@ -71,14 +71,17 @@ def hc_mix(
     ``w_inject`` is None for the final mix before the LM head, which produces no injection.
     """
     T, _, D = state.shape
-    xn = grouped_rms_norm(state, w_norm, eps, hc)          # [T, hc*D]
+    # Compute in the weights' dtype. grouped_rms_norm accumulates in at least float32, and
+    # letting that choice reach the GEMM both mismatches the weights and would silently
+    # pick a slower kernel -- on Turing a batched bf16 GEMM is 12-22x slower than fp16.
+    xn = grouped_rms_norm(state, w_norm, eps, hc).to(w_down.dtype)   # [T, hc*D]
 
     # The 1/hc is applied before the SiLU, so it is not a rescale of the gate.
     lo = F.silu(F.linear(xn, w_down) / hc)                 # [T, low_rank]
     gate = torch.sigmoid(F.linear(lo, w_up))               # [T, hc*D]
 
     gated = (xn * gate).reshape(T, hc, D)
-    mixed = gated.mean(dim=1)                              # [T, D]
+    mixed = gated.mean(dim=1).to(state.dtype)              # [T, D]
 
     inject = F.linear(xn, w_inject) if w_inject is not None else None
     return mixed, inject

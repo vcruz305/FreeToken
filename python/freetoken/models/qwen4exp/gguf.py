@@ -34,6 +34,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from freetoken.models.config import (
+    FullAttentionGroupConfig,
+    LinearGatedDeltaGroupConfig,
+    ModelConfig,
+    RotaryConfig,
+)
+
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
 
@@ -41,8 +48,17 @@ _ARCH = "qwen4exp"
 
 
 def _kv(shim: "GgufConfigShim", key: str, default: Any = None) -> Any:
-    """One ``qwen4exp.*`` metadata value, or ``default`` when absent."""
-    return shim.get(f"{_ARCH}.{key}", default)
+    """Read ``qwen4exp.<key>`` from the GGUF metadata.
+
+    Raises rather than returning None for a key with no default: a geometry value that
+    silently reads as None becomes a TypeError several frames away from the missing key.
+    """
+    val = shim.metadata.get(f"{shim.model_type}.{key}", default)
+    if val is None and default is None:
+        raise ValueError(
+            f"GGUF {shim.model_path}: missing required key {shim.model_type}.{key}"
+        )
+    return val
 
 
 def full_attention_layers(block_count: int, interval: int) -> tuple[int, ...]:
@@ -377,3 +393,133 @@ def check_ple_tables(geo: dict[str, Any], table_rows: int) -> None:
             f"qwen4exp GGUF: per_layer_token_embd has {table_rows} rows but the hash heads "
             f"span {running}"
         )
+
+
+def _expert_types_per_layer(
+    model_path: str, num_layers: int
+) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    """``(gate_up, down)`` ggml types of the routed-expert banks, one entry per layer.
+
+    Every published qwen4exp build is a dynamic quant, so both banks vary by layer; the
+    slot pool pads to the widest type and strides by it. Returns None only if the file
+    cannot be read, since ``parse_gguf_config`` also runs for metadata-only inspection.
+    """
+    from .gguf_experts import gguf_expert_types
+
+    try:
+        types = gguf_expert_types(model_path, num_layers)
+    except Exception:
+        return None
+    return (tuple(int(t) for t in types["gate_up"]), tuple(int(t) for t in types["down"]))
+
+
+def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
+    """Build a ModelConfig from a qwen4exp checkpoint.
+
+    Every block is a decoder layer -- unlike qwen35moe there is no NextN/MTP block to drop.
+
+    Two decisions worth stating because they are choices, not readings of the file:
+
+    * ``rope.dimension_sections`` is ignored. qwen4exp applies ggml_rope_multi, but all
+      four position axes carry the same value for a text-only batch, and ggml advances
+      every per-axis theta by the same theta_scale with no per-section reset (the reset is
+      the vision path). So which section a dimension falls in stops mattering and the
+      result is exactly NeoX RoPE. If image input is ever added this stops being true.
+    * ``use_qk_norm`` is True: attn_q_norm / attn_k_norm are per-head RMS norms over
+      key_length, present on every full-attention layer.
+    """
+    geo = parse_gguf_geometry(shim)
+    num_layers = geo["block_count"]
+
+    full_ids = geo["full_attention_layers"]
+    linear_ids = tuple(i for i in range(num_layers) if i not in set(full_ids))
+
+    full_rotary = RotaryConfig(
+        head_dim=geo["key_length"],
+        rotary_dim=int(_kv(shim, "rope.dimension_count")),
+        max_position=geo["context_length"],
+        base=geo["rope_freq_base"],
+        scaling=None,
+    )
+    groups = tuple(
+        sorted(
+            (
+                FullAttentionGroupConfig(
+                    name="full",
+                    layer_ids=full_ids,
+                    num_kv_heads=geo["num_kv_heads"],
+                    head_dim=geo["key_length"],
+                    rotary_config=full_rotary,
+                ),
+                LinearGatedDeltaGroupConfig(
+                    name="linear",
+                    layer_ids=linear_ids,
+                    num_key_heads=geo["ssm_groups"],
+                    num_value_heads=geo["ssm_heads"],
+                    key_head_dim=geo["ssm_state"],
+                    value_head_dim=geo["ssm_state"],
+                    conv_kernel_dim=int(_kv(shim, "ssm.conv_kernel")),
+                    output_gate=True,
+                ),
+            ),
+            key=lambda g: g.layer_ids[0] if g.layer_ids else 1 << 30,
+        )
+    )
+
+    config = ModelConfig(
+        num_layers=num_layers,
+        num_qo_heads=geo["num_heads"],
+        num_kv_heads=geo["num_kv_heads"],
+        head_dim=geo["key_length"],
+        hidden_size=geo["hidden_size"],
+        vocab_size=shim.vocab_size,
+        intermediate_size=0,
+        hidden_act="silu",
+        rms_norm_eps=float(_kv(shim, "attention.layer_norm_rms_epsilon")),
+        tie_word_embeddings=shim.tie_word_embeddings,
+        rotary_config=full_rotary,
+        num_experts=geo["num_experts"],
+        num_experts_per_tok=geo["experts_used"],
+        moe_intermediate_size=geo["expert_ffn"],
+        shared_expert_intermediate_size=geo["shared_expert_ffn"],
+        norm_topk_prob=True,
+        moe_enabled=True,
+        use_qk_norm=True,
+        model_type=shim.model_type,
+        architectures=list(shim.architectures),
+        vision_config=None,
+        image_token_id=None,
+        attention_groups=groups,
+        expert_quant="gguf",
+        gguf_expert_types=_expert_types_per_layer(shim.model_path, num_layers),
+        gguf_model_path=shim.model_path,
+        weight_block_size=None,
+        attn_quant="gguf",
+        dense_quant="gguf",
+        lm_head_quant="gguf",
+    )
+
+    return config
+
+
+def geometry_from_path(model_path: str) -> dict[str, Any]:
+    """The qwen4exp-only geometry, re-read from the checkpoint.
+
+    ModelConfig is a frozen dataclass with no field for hyper-connection, indexer or PLE
+    geometry, and it is the only object a module constructor receives. Rather than smuggle
+    a dict onto it, the model re-derives these from ``config.gguf_model_path`` -- which it
+    must hold anyway, because the per-tensor ggml types are only in the file. Reading the
+    KV block is a metadata-only load, not a weight load.
+    """
+    from freetoken.models.gguf.config import GgufConfigShim
+    from freetoken.models.gguf.reader import gguf_architecture, load_gguf_metadata
+
+    shim = GgufConfigShim(
+        architectures=[],
+        model_path=model_path,
+        model_type=gguf_architecture(model_path),
+        metadata=load_gguf_metadata(model_path),
+        vocab_size=0,
+        tie_word_embeddings=False,
+    )
+    return parse_gguf_geometry(shim)

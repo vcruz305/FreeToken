@@ -134,3 +134,80 @@ def test_head_count_is_validated():
 def test_context_window_shape_and_order():
     """ctx[0] is the token; ctx[s] is s positions back, from an oldest-first list."""
     assert context_window(5, [1, 2], EOS, 3) == [5, 2, 1]
+
+
+# ---------------------------------------------------------------------------------------
+# The dilated causal conv, and the invariant its history exists to guarantee.
+# ---------------------------------------------------------------------------------------
+
+import torch  # noqa: E402
+
+from freetoken.models.qwen4exp.ple import dilated_causal_conv  # noqa: E402
+
+CONV_K, DILATION, WIDTH = 4, 3, 7
+HIST = (CONV_K - 1) * DILATION
+
+
+def _weights(seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(WIDTH, CONV_K, generator=g, dtype=torch.float64)
+
+
+def test_tap_formula_matches_the_reference_indexing():
+    """out[t,c] = sum_k w[c,k] * x[t - (K-1-k)*dilation, c], with zeros before the start."""
+    w = _weights()
+    g = torch.Generator().manual_seed(1)
+    x = torch.randn(9, WIDTH, generator=g, dtype=torch.float64)
+    got = dilated_causal_conv(x, w, history=None, dilation=DILATION)
+
+    want = torch.zeros_like(x)
+    for t in range(x.shape[0]):
+        for k in range(CONV_K):
+            src = t - (CONV_K - 1 - k) * DILATION
+            if src >= 0:
+                want[t] += w[:, k] * x[src]
+    torch.testing.assert_close(got, want)
+
+
+def test_chunked_matches_single_shot():
+    """The whole point of carrying a history: a decode step must land where a one-shot
+    prefill would. Without it every continuation convolves as if it were at position 0,
+    which produces no error and no NaN -- just a quietly missing term."""
+    w = _weights(2)
+    g = torch.Generator().manual_seed(3)
+    x = torch.randn(20, WIDTH, generator=g, dtype=torch.float64)
+
+    one_shot = dilated_causal_conv(x, w, history=None, dilation=DILATION)
+
+    out, hist = [], None
+    for lo, hi in ((0, 7), (7, 8), (8, 14), (14, 20)):   # prefill, then decode-sized steps
+        seg = x[lo:hi]
+        out.append(dilated_causal_conv(seg, w, history=hist, dilation=DILATION))
+        prev = hist if hist is not None else x.new_zeros(HIST, WIDTH)
+        hist = torch.cat([prev, seg], dim=0)[-HIST:]
+    torch.testing.assert_close(torch.cat(out, dim=0), one_shot)
+
+
+def test_a_cold_history_is_actually_different():
+    """Guards the test above from passing vacuously."""
+    w = _weights(4)
+    g = torch.Generator().manual_seed(5)
+    x = torch.randn(20, WIDTH, generator=g, dtype=torch.float64)
+    one_shot = dilated_causal_conv(x, w, history=None, dilation=DILATION)
+    cold_tail = dilated_causal_conv(x[7:], w, history=None, dilation=DILATION)
+    assert not torch.allclose(cold_tail, one_shot[7:])
+
+
+def test_history_shape_is_validated():
+    w = _weights()
+    x = torch.randn(4, WIDTH, dtype=torch.float64)
+    with pytest.raises(ValueError, match="history"):
+        dilated_causal_conv(x, w, history=torch.zeros(HIST + 1, WIDTH, dtype=torch.float64),
+                            dilation=DILATION)
+
+
+def test_weight_orientation_is_validated():
+    """[channels, taps], not [taps, channels] -- only a shape error when they differ."""
+    x = torch.randn(4, WIDTH, dtype=torch.float64)
+    with pytest.raises(ValueError, match="channels"):
+        dilated_causal_conv(x, _weights().T.contiguous(), history=None, dilation=DILATION)

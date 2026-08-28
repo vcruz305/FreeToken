@@ -359,13 +359,20 @@ class Engine:
         if linear_group is not None:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
 
+            slots = _linear_pool_num_slots(config)
             self.linear_state_pool = LinearStatePool(
                 group=linear_group,
-                num_slots=_linear_pool_num_slots(config),
+                num_slots=slots,
                 dtype=self.dtype,
                 device=self.device,
                 tp_size=config.tp_info.size,
             )
+            # A model may carry a second per-request recurrent history of its own (qwen4exp
+            # keeps the PLE conv tail). Size it off the same slot count so the two are keyed
+            # identically and a request's histories cannot drift apart.
+            init_state = getattr(self.model, "init_state", None)
+            if init_state is not None:
+                init_state(slots, self.device, self.dtype)
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None

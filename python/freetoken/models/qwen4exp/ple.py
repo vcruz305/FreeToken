@@ -217,6 +217,9 @@ class Qwen4ExpPLE(BaseOP):
         self.conv1d = torch.empty(width, self.conv_kernel)
         # The compute dtype, taken from a tensor allocated under the engine's context.
         self._dtype = self.norm_key.dtype
+        # Bound by init_conv_state once the engine knows how many state slots exist.
+        self.conv_state = None
+        self._hist = (self.conv_kernel - 1) * self.ngram_size
 
     def bind_table(self, model_path: str) -> None:
         """Point at the packed PLE table without copying it.
@@ -257,6 +260,7 @@ class Qwen4ExpPLE(BaseOP):
         emb: torch.Tensor,
         *,
         history: torch.Tensor | None = None,
+        batch=None,
     ) -> torch.Tensor:
         """``state`` [T, hc, D]; ``emb`` [T, n_heads*head_dim] gathered on the host.
 
@@ -283,8 +287,68 @@ class Qwen4ExpPLE(BaseOP):
         gated = value.unsqueeze(1) * gate.unsqueeze(-1)                    # [T, hc, D]
 
         normalized = grouped_rms_norm(gated, self.norm_conv, self.eps, self.hc)  # [T, hc*D]
-        conv_out = dilated_causal_conv(
-            normalized, self.conv1d, history=history, dilation=self.ngram_size
-        )
+        if batch is not None:
+            conv_out = self._conv_with_state(normalized, batch)
+        else:
+            conv_out = dilated_causal_conv(
+                normalized, self.conv1d, history=history, dilation=self.ngram_size
+            )
         conv_out = F.silu(conv_out).reshape(T, self.hc, self.hidden_size)
         return state + gated + conv_out
+
+
+    # -----------------------------------------------------------------------------------
+    # Conv history.
+    #
+    # The dilated conv reaches (K-1)*dilation positions back, so a decode step needs the
+    # tail of the previous forward. Without it every generated token convolves as if it
+    # were at the start of the sequence -- which does not crash and does not look obviously
+    # wrong, it just quietly drops one of the three terms PLE contributes.
+    #
+    # Kept in a persistent per-slot buffer indexed the same way the GDN state is, so the
+    # addresses are stable under CUDA graph capture.
+    # -----------------------------------------------------------------------------------
+
+    def init_conv_state(self, num_slots: int, device, dtype) -> None:
+        hist = (self.conv_kernel - 1) * self.ngram_size
+        self._hist = hist
+        self.conv_state = torch.zeros(
+            num_slots, hist, self.hc * self.hidden_size, device=device, dtype=dtype
+        )
+
+    def _conv_with_state(self, normalized: torch.Tensor, batch) -> torch.Tensor:
+        """Run the dilated conv over ``normalized`` using each request's stored tail.
+
+        A prefill segment chains within itself and only needs the stored tail in front of
+        its first row; a decode row is a segment of length one, so its whole window comes
+        from the store. Both write back the last ``hist`` rows for the next forward.
+        """
+        if self.conv_state is None:
+            # No state pool (warmup, or a direct call): fall back to a cold history. Only
+            # correct at the start of a sequence, which is what warmup is.
+            return dilated_causal_conv(
+                normalized, self.conv1d, history=None, dilation=self.ngram_size
+            )
+
+        hist, width = self._hist, normalized.shape[1]
+        out = torch.empty_like(normalized)
+        row = 0
+        for req in batch.reqs:
+            n = req.device_len - req.cached_len
+            if n <= 0:
+                continue
+            slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+            seg = normalized[row : row + n]
+            # A sequence that has produced nothing yet has no history to carry in.
+            prev = (
+                self.conv_state[slot]
+                if req.cached_len > 0
+                else seg.new_zeros(hist, width)
+            )
+            out[row : row + n] = dilated_causal_conv(
+                seg, self.conv1d, history=prev, dilation=self.ngram_size
+            )
+            tail = torch.cat([prev, seg], dim=0)[-hist:]
+            self.conv_state[slot] = tail
+            row += n
+        return out

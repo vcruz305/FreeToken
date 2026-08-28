@@ -206,14 +206,15 @@ class Qwen4ExpModel(BaseOP):
         # any other path that calls the model directly has no such buffer; those are never
         # captured, so falling back to an inline gather there is safe. Only a captured
         # graph cannot contain the host work.
-        host = get_global_ctx().batch.host_inputs or {}
+        batch = get_global_ctx().batch
+        host = batch.host_inputs or {}
         ple_emb = host.get("ple_emb")
         if ple_emb is None:
             ple_emb = self._gather_inline(input_ids)
 
         for i, layer in enumerate(self.layers.op_list):
             if i in self.ple_layers:
-                state = self.ple.forward(state, ple_emb, history=None)
+                state = self.ple.forward(state, ple_emb, batch=batch)
             state = layer.forward(state)
         mixed, _ = self.hc_head.mix(state)
         return mixed
@@ -243,6 +244,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
         convert_qwen4exp_to_gguf(self, config, model_path=config.gguf_model_path)
         self.model.ple.bind_table(config.gguf_model_path)
+
+    def init_state(self, num_slots: int, device, dtype) -> None:
+        """Allocate PLE's conv history, one row per linear-state slot.
+
+        Called by the engine once the linear state pool is sized, so PLE's history is
+        keyed exactly as the GDN's is and a request's two histories cannot drift apart.
+        """
+        self.model.ple.init_conv_state(num_slots, device, dtype)
 
     def host_input_spec(self) -> dict:
         """The PLE embedding is a graph input, not host work inside the capture.

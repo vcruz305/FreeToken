@@ -362,6 +362,14 @@ def parse_gguf_geometry(shim: "GgufConfigShim") -> dict[str, Any]:
         "ple_head_vocab_sizes": tuple(
             int(x) for x in (_kv(shim, "ple.head_vocab_sizes") or ())
         ),
+        "ple_head_multipliers": tuple(
+            int(x) for x in (_kv(shim, "ple.layer_multipliers") or ())
+        ),
+        "ple_conv_kernel": int(_kv(shim, "ple.conv_kernel", 0)),
+        # The image token stands in when a position carries no text token; the reference
+        # falls back to EOS for files written before that key existed.
+        "ple_eos_token_id": int(_kv(shim, "ple.eos_token_id", 0)),
+        "ple_image_token_id": int(_kv(shim, "ple.image_token_id", 0)),
         "rope_dimension_sections": tuple(_kv(shim, "rope.dimension_sections") or ()),
         "rope_freq_base": float(_kv(shim, "rope.freq_base", 0.0)),
         "context_length": int(_kv(shim, "context_length", 0)),
@@ -523,3 +531,386 @@ def geometry_from_path(model_path: str) -> dict[str, Any]:
         tie_word_embeddings=False,
     )
     return parse_gguf_geometry(shim)
+
+
+# --------------------------------------------------------------------------------------
+# Weight loading
+#
+# The GDN tensors are V-reordered exactly as qwen35moe's are: llama.cpp's converter has
+# qwen4exp inherit ``_LinearAttentionVReorderBase`` (conversion/qwen4exp.py), the same base
+# qwen35moe uses. So the un-tiling helpers there apply unchanged and are imported rather
+# than re-derived.
+# --------------------------------------------------------------------------------------
+
+
+def _q35():
+    """The qwen35moe GGUF helpers, imported lazily to keep import order simple."""
+    from freetoken.models.qwen3_5_moe import gguf as m
+
+    return m
+
+
+def _scan_types(model_path: str) -> dict[tuple[int, str], int]:
+    return _q35()._scan_quant_types(model_path)
+
+
+def convert_qwen4exp_to_gguf(model, config, *, model_path: str) -> None:
+    """Swap dense ops for GGUF-quant ops so the packed buffers have somewhere to land.
+
+    Only the projections become GGUF ops. Everything the checkpoint stores small and dense
+    -- the hyper-connection weights, the norms, the routers -- stays an ordinary tensor and
+    is dequantised at load time, matching how qwen35moe treats its norms and gates.
+    """
+    from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear, GGUFLMHead, gguf_merged_or_plain
+
+    q35 = _q35()
+    types = _scan_types(model_path)
+    geo = geometry_from_path(model_path)
+    H = config.hidden_size
+
+    def qt(layer: int, suffix: str) -> int:
+        key = (layer, suffix)
+        if key not in types:
+            raise Qwen4ExpLayoutError(
+                f"qwen4exp GGUF: no quant type for blk.{layer}.{suffix}; the checkpoint "
+                f"does not match the layout this adapter expects"
+            )
+        return types[key]
+
+    gt = types[(-1, "token_embd.weight")]
+    model.model.embed_tokens = GGUFEmbedding(config.vocab_size, H, quant_type=gt)
+    if not config.tie_word_embeddings:
+        # Untied: slice to the last prefill position before the projection, or a long
+        # prompt materialises [prompt_len, vocab] logits for no reason.
+        model.lm_head = GGUFLMHead(
+            H, config.vocab_size, quant_type=types[(-1, "output.weight")]
+        )
+
+    full_ids = set(geo["full_attention_layers"])
+    n_head, n_kv, hd = config.num_qo_heads, config.num_kv_heads, config.head_dim
+    g = config.linear_attention_group()
+
+    for i, layer in enumerate(model.model.layers.op_list):
+        if i in full_ids:
+            # q carries its own gate, so the q half is twice the head width.
+            layer.self_attn.qkv_proj = gguf_merged_or_plain(
+                H,
+                [2 * n_head * hd, n_kv * hd, n_kv * hd],
+                [qt(i, "attn_q.weight"), qt(i, "attn_k.weight"), qt(i, "attn_v.weight")],
+            )
+            layer.self_attn.o_proj = GGUFLinear(
+                n_head * hd, H, quant_type=qt(i, "attn_output.weight")
+            )
+        else:
+            qkv = g.num_key_heads * g.key_head_dim * 2 + g.num_value_heads * g.value_head_dim
+            layer.linear_attn.in_proj = gguf_merged_or_plain(
+                H,
+                [qkv, g.num_value_heads * g.value_head_dim, g.num_value_heads, g.num_value_heads],
+                [
+                    qt(i, "attn_qkv.weight"),
+                    qt(i, "attn_gate.weight"),
+                    qt(i, "ssm_beta.weight"),
+                    qt(i, "ssm_alpha.weight"),
+                ],
+            )
+            # out_proj stays dense: its COLUMNS index the V-head dimension, and a column
+            # permutation on packed blocks is unsafe -- a 128-wide head straddles quant
+            # block boundaries. Same reason qwen35moe leaves it dense.
+
+        layer.mlp.shared_expert.gate_up_proj = gguf_merged_or_plain(
+            H,
+            [config.shared_expert_intermediate_size] * 2,
+            [qt(i, "ffn_gate_shexp.weight"), qt(i, "ffn_up_shexp.weight")],
+        )
+        layer.mlp.shared_expert.down_proj = GGUFLinear(
+            config.shared_expert_intermediate_size, H, quant_type=qt(i, "ffn_down_shexp.weight")
+        )
+
+
+def _kv_meta(model_path: str, key: str):
+    from freetoken.models.gguf.reader import gguf_architecture, load_gguf_metadata
+
+    return load_gguf_metadata(model_path)[f"{gguf_architecture(model_path)}.{key}"]
+
+
+def iter_gguf_weights(
+    model_path: str,
+    device,
+    *,
+    include_moe_experts: bool,
+    include_non_moe: bool,
+):
+    """Yield ``(freetoken_param_name, tensor)`` for every non-expert qwen4exp tensor.
+
+    Routed experts are served from the offload cache and are skipped here, as in qwen35moe.
+
+    The GDN tensors need the same V-head un-tiling qwen35moe applies: llama.cpp's converter
+    has qwen4exp inherit ``_LinearAttentionVReorderBase``, so the reorder is identical and
+    the helpers are imported rather than re-derived. Row permutations are safe on packed
+    blocks (each row is its own run of blocks); ``ssm_out`` is the exception, because its
+    COLUMNS index the V heads and a 128-wide head straddles quant block boundaries -- it is
+    dequantised, un-tiled dense, and yielded as a plain ``.weight``.
+
+    Indexer tensors are skipped deliberately: this adapter runs dense attention, which is
+    exactly equivalent below ``indexer_top_k`` (2048) tokens. A silent skip would be
+    indistinguishable from having forgotten them, so it is counted and logged.
+    """
+    import torch
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    q35 = _q35()
+    _to_bf16, _to_f32 = q35._to_bf16, q35._to_f32
+    _dequant_any, _ungroup_v = q35._dequant_any, q35._ungroup_v
+    _ungroup_packed_rows = q35._ungroup_packed_rows
+
+    assert not include_moe_experts, (
+        "qwen4exp keeps its routed experts in the offload cache; they are loaded by the "
+        "expert-bank loader, not by iter_gguf_weights."
+    )
+    assert include_non_moe
+
+    geo = geometry_from_path(model_path)
+    quant_map = _scan_types(model_path)
+    block_count = geo["block_count"]
+    full_ids = set(geo["full_attention_layers"])
+    ple_layers = geo["ple_layers"]
+
+    vK, vN, vD = geo["ssm_groups"], geo["ssm_heads"], geo["ssm_state"]
+    vR = vN // vK
+    untile = vK != vN
+    qk_rows = 2 * vK * vD
+    qkv_size = geo["gdn_qkv"]
+    conv_kernel = int(_kv_meta(model_path, "ssm.conv_kernel"))
+
+    qkv_buf: dict = {}
+    in_proj_buf: dict = {}
+    gate_up_buf: dict = {}
+    skipped_indexer = 0
+
+    for t in iter_gguf_tensors(model_path):
+        name = t.name
+
+        if not name.startswith("blk."):
+            if name == "token_embd.weight":
+                yield "model.embed_tokens.qweight", t.packed()
+            elif name == "output.weight":
+                yield "lm_head.qweight", t.packed()
+            elif name == "output_hc_norm.weight":
+                yield "model.hc_head.norm", _to_bf16(t)
+            elif name == "output_hc_down.weight":
+                yield "model.hc_head.down", _dequant_any(t)
+            elif name == "output_hc_up.weight":
+                yield "model.hc_head.up", _dequant_any(t)
+            elif name == "per_layer_token_embd.weight":
+                yield "model.ple.table.qweight", t.packed()
+            else:
+                raise Qwen4ExpLayoutError(f"qwen4exp GGUF: unrecognised global {name!r}")
+            continue
+
+        _, idx, suffix = name.split(".", 2)
+        layer = int(idx)
+        if layer >= block_count:
+            raise Qwen4ExpLayoutError(
+                f"qwen4exp GGUF: {name!r} is past block_count {block_count}"
+            )
+        base = f"model.layers.{layer}"
+
+        if suffix in _EXPERT_SUFFIXES:
+            continue
+        if suffix.startswith("indexer."):
+            skipped_indexer += 1
+            continue
+
+        # Hyper-connections, on every layer. Small and dense in the module, so dequantised.
+        if suffix.startswith("hc_"):
+            which, part = suffix[3:].split("_", 1)
+            part = part.replace(".weight", "")
+            dest = f"{base}.hc_{which}.{part}"
+            yield dest, (_to_bf16(t) if part in ("norm", "inject") else _dequant_any(t))
+            continue
+
+        if suffix in _PLE_LAYER:
+            if layer not in ple_layers:
+                raise Qwen4ExpLayoutError(
+                    f"qwen4exp GGUF: PLE tensor {name!r} on a layer that is not in "
+                    f"ple.layers {list(ple_layers)}"
+                )
+            part = suffix.replace(".weight", "")[4:]
+            if part in ("key", "value"):
+                yield f"model.ple.{part}.qweight", t.packed()
+            else:
+                yield f"model.ple.{part}", _to_bf16(t)
+            continue
+
+        # MoE router and shared expert, on every layer.
+        if suffix == "ffn_gate_inp.weight":
+            yield f"{base}.mlp.gate.weight", _to_bf16(t)
+            continue
+        if suffix == "ffn_gate_inp_shexp.weight":
+            # [hidden] in the file; the module is Linear(hidden, 1).
+            yield f"{base}.mlp.shared_expert_gate.weight", _to_bf16(t).reshape(1, -1)
+            continue
+        if suffix == "ffn_down_shexp.weight":
+            yield f"{base}.mlp.shared_expert.down_proj.qweight", t.packed()
+            continue
+        if suffix in ("ffn_gate_shexp.weight", "ffn_up_shexp.weight"):
+            slot = "gate" if suffix.startswith("ffn_gate") else "up"
+            gate_up_buf.setdefault(layer, {})[slot] = t.packed()
+            slots = gate_up_buf.get(layer)
+            if slots and "gate" in slots and "up" in slots:
+                types = [
+                    quant_map.get((layer, "ffn_gate_shexp.weight")),
+                    quant_map.get((layer, "ffn_up_shexp.weight")),
+                ]
+                dest = f"{base}.mlp.shared_expert.gate_up_proj"
+                if len(set(types)) == 1:
+                    yield f"{dest}.qweight", torch.cat([slots["gate"], slots["up"]], dim=0)
+                else:
+                    yield f"{dest}.qweight_0", slots["gate"]
+                    yield f"{dest}.qweight_1", slots["up"]
+                del gate_up_buf[layer]
+            continue
+
+        if layer in full_ids:
+            if suffix in ("attn_q.weight", "attn_k.weight", "attn_v.weight"):
+                part = suffix.split("_")[1][0]
+                qkv_buf.setdefault(layer, {})[part] = t.packed()
+                slots = qkv_buf.get(layer)
+                if slots and {"q", "k", "v"} <= set(slots):
+                    types = [
+                        quant_map.get((layer, f"attn_{p}.weight")) for p in ("q", "k", "v")
+                    ]
+                    dest = f"{base}.self_attn.qkv_proj"
+                    if len(set(types)) == 1:
+                        yield f"{dest}.qweight", torch.cat(
+                            [slots["q"], slots["k"], slots["v"]], dim=0
+                        )
+                    else:
+                        for i, p in enumerate(("q", "k", "v")):
+                            yield f"{dest}.qweight_{i}", slots[p]
+                    del qkv_buf[layer]
+            elif suffix == "attn_output.weight":
+                yield f"{base}.self_attn.o_proj.qweight", t.packed()
+            elif suffix == "attn_q_norm.weight":
+                yield f"{base}.self_attn.q_norm.weight", _to_bf16(t)
+            elif suffix == "attn_k_norm.weight":
+                yield f"{base}.self_attn.k_norm.weight", _to_bf16(t)
+            else:
+                raise Qwen4ExpLayoutError(
+                    f"qwen4exp GGUF: unmapped full-attention tensor {name!r}"
+                )
+            continue
+
+        # GDN layers.
+        if suffix == "attn_qkv.weight":
+            w = t.packed()
+            if untile:
+                w = torch.cat(
+                    [w[:qk_rows], _ungroup_packed_rows(w[qk_rows:], vK, vR, vD)], dim=0
+                )
+            in_proj_buf.setdefault(layer, {})["qkv"] = w
+        elif suffix == "attn_gate.weight":
+            w = t.packed()
+            if untile:
+                w = _ungroup_packed_rows(w, vK, vR, vD)
+            in_proj_buf.setdefault(layer, {})["gate"] = w
+        elif suffix in ("ssm_beta.weight", "ssm_alpha.weight"):
+            w = t.packed()
+            if untile:
+                w = _ungroup_packed_rows(w, vK, vR, 1)  # one row per V head
+            in_proj_buf.setdefault(layer, {})[
+                "beta" if suffix.startswith("ssm_beta") else "alpha"
+            ] = w
+        elif suffix == "ssm_out.weight":
+            w = _dequant_any(t)
+            if untile:
+                w = _ungroup_v(w, 1, vK, vR, vD)
+            yield f"{base}.linear_attn.out_proj.weight", w
+            continue
+        elif suffix == "ssm_a":
+            a = _to_f32(t)
+            if untile:
+                a = _ungroup_v(a, 0, vK, vR, 1)
+            if torch.any(a >= 0):
+                raise Qwen4ExpLayoutError(
+                    f"qwen4exp GGUF: blk.{layer}.ssm_a has non-negative entries, which "
+                    f"would make log(-A) NaN"
+                )
+            yield f"{base}.linear_attn.A_log", torch.log(-a)
+            continue
+        elif suffix == "ssm_dt.bias":
+            dt = _to_f32(t)
+            if untile:
+                dt = _ungroup_v(dt, 0, vK, vR, 1)
+            yield f"{base}.linear_attn.dt_bias", dt
+            continue
+        elif suffix == "ssm_norm.weight":
+            yield f"{base}.linear_attn.norm.weight", _to_bf16(t)
+            continue
+        elif suffix == "ssm_conv1d.weight":
+            w = _to_bf16(t).reshape(qkv_size, conv_kernel)
+            if untile:
+                qk, v = w[:qk_rows], w[qk_rows:]
+                w = torch.cat([qk, _ungroup_v(v, 0, vK, vR, vD)], dim=0)
+            yield f"{base}.linear_attn.conv1d.weight", w.reshape(qkv_size, 1, conv_kernel)
+            continue
+        else:
+            raise Qwen4ExpLayoutError(f"qwen4exp GGUF: unmapped GDN tensor {name!r}")
+
+        slots = in_proj_buf.get(layer)
+        if slots and {"qkv", "gate", "beta", "alpha"} <= set(slots):
+            parts = ("qkv", "gate", "beta", "alpha")
+            src = ("attn_qkv", "attn_gate", "ssm_beta", "ssm_alpha")
+            types = [quant_map.get((layer, f"{s}.weight")) for s in src]
+            dest = f"{base}.linear_attn.in_proj"
+            if len(set(types)) == 1:
+                yield f"{dest}.qweight", torch.cat([slots[p] for p in parts], dim=0)
+            else:
+                for i, p in enumerate(parts):
+                    yield f"{dest}.qweight_{i}", slots[p]
+            del in_proj_buf[layer]
+
+    if qkv_buf or in_proj_buf or gate_up_buf:
+        raise Qwen4ExpLayoutError(
+            f"qwen4exp GGUF: incomplete fused projections left over -- "
+            f"qkv {sorted(qkv_buf)}, in_proj {sorted(in_proj_buf)}, "
+            f"shared_expert {sorted(gate_up_buf)}"
+        )
+    if skipped_indexer:
+        from freetoken.utils import init_logger
+
+        init_logger(__name__).info_rank0(
+            f"qwen4exp: skipped {skipped_indexer} indexer tensors; attention runs dense, "
+            f"which is exact below indexer_top_k ({geo['indexer_top_k']}) tokens"
+        )
+
+
+def ple_table_rows(model_path: str) -> int:
+    """Rows in ``per_layer_token_embd``, read from the tensor table.
+
+    Not derivable from the metadata: the head vocab sizes sum to 320001446 while the table
+    is 320001536 rows, padded to a 64-row boundary. Sizing the embedding from the sum would
+    leave the last 90 rows unaddressable and, worse, mis-size the packed buffer.
+    """
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    for t in iter_gguf_tensors(model_path):
+        if t.name == "per_layer_token_embd.weight":
+            # GGUF dims are fastest-first; the row count is the slow axis.
+            return int(t.shape[-1]) if len(t.shape) > 1 else int(t.shape[0])
+    raise Qwen4ExpLayoutError("qwen4exp GGUF: per_layer_token_embd.weight not found")
+
+
+def ple_quant_types(model_path: str, ple_layer: int) -> dict:
+    """ggml types of the three PLE tensors that stay packed."""
+    types = _scan_types(model_path)
+    out = {}
+    for key, src in (
+        ("table", (-1, "per_layer_token_embd.weight")),
+        ("key", (ple_layer, "ple_key.weight")),
+        ("value", (ple_layer, "ple_value.weight")),
+    ):
+        if src not in types:
+            raise Qwen4ExpLayoutError(f"qwen4exp GGUF: no quant type for {src[1]!r}")
+        out[key] = types[src]
+    return out

@@ -26,7 +26,14 @@ The parts that are easy to get wrong and impossible to see in a shape check:
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
+import torch
+import torch.nn.functional as F
+from freetoken.layers import BaseOP
+
+from .hyper_connections import grouped_rms_norm
 
 _U64 = 0xFFFFFFFFFFFFFFFF
 
@@ -95,3 +102,134 @@ def ple_rows(
                 h = base + g
                 out[i, h] = mixed % head_vocab_sizes[h] + head_offsets[h]
     return out
+
+
+# ---------------------------------------------------------------------------------------
+# The PLE block itself.
+#
+# Transcribed from llama.cpp ``build_ple``. The gather feeds a key/value pair, the key is
+# scored against the current residual state per stream, and the gated value plus a dilated
+# causal convolution of it are added back to the state.
+# ---------------------------------------------------------------------------------------
+
+
+def signed_sqrt_gate(scores: torch.Tensor) -> torch.Tensor:
+    """``sigmoid(sgn(s) * sqrt(clamp(|s|, 1e-6, inf)))``.
+
+    The signed square root compresses the score before the sigmoid, so a large dot product
+    does not saturate the gate. The clamp floor keeps the gradient of sqrt finite at zero;
+    it is in the reference and is kept because dropping it changes values near s == 0.
+    """
+    mag = torch.sqrt(torch.clamp(scores.abs(), min=1e-6))
+    return torch.sigmoid(torch.sign(scores) * mag)
+
+
+def dilated_causal_conv(
+    x: torch.Tensor, weight: torch.Tensor, *, history: torch.Tensor | None, dilation: int
+) -> torch.Tensor:
+    """Depthwise causal conv, dilated, as a sum of shifted copies.
+
+    ``out[t, c] = sum_k w[k, c] * x[t - (K-1-k)*dilation, c]`` -- note the tap index runs
+    backwards, so tap ``K-1`` is the current position and tap 0 reaches furthest back. Each
+    tap is one weight per channel; there is no mixing across channels or across positions
+    within a tap.
+
+    ``history`` is the ``(K-1)*dilation`` positions preceding ``x``, or None at the start of
+    a sequence, where the reference reads zeros. Passing it explicitly (rather than holding
+    state here) is what lets a chunked prefill match a single-shot one.
+    """
+    T, C = x.shape
+    K = weight.shape[0]
+    hist = (K - 1) * dilation
+    if history is None:
+        history = x.new_zeros(hist, C)
+    elif history.shape != (hist, C):
+        raise ValueError(
+            f"PLE conv history should be {(hist, C)}, got {tuple(history.shape)}"
+        )
+    padded = torch.cat([history, x], dim=0)                 # [hist + T, C]
+
+    out = None
+    for k in range(K):
+        start = hist - (K - 1 - k) * dilation
+        term = padded[start : start + T] * weight[k]
+        out = term if out is None else out + term
+    return out
+
+
+class Qwen4ExpPLE(BaseOP):
+    """n-gram hashed per-layer embeddings, applied on one layer.
+
+    ``table`` is the 320-million-row shared embedding (~29 GB of the checkpoint); only the
+    ``ple_n_heads`` rows a token hashes to are ever gathered, so it is a GGUFEmbedding
+    rather than anything dequantised.
+    """
+
+    def __init__(
+        self, geo: dict, hidden_size: int, eps: float, quant_types: dict, table_rows: int
+    ):
+        from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
+
+        self.hc = geo["hc_count"]
+        self.eps = eps
+        self.hidden_size = hidden_size
+        self.n_heads = (geo["ple_ngram_size"] - 1) * geo["ple_heads_per_ngram"]
+        self.head_dim = geo["ple_input_dim"]
+        self.ngram_size = geo["ple_ngram_size"]
+        self.heads_per_ngram = geo["ple_heads_per_ngram"]
+        self.multipliers = list(geo["ple_head_multipliers"])
+        self.head_offsets = list(geo["ple_head_offsets"])
+        self.head_vocab_sizes = list(geo["ple_head_vocab_sizes"])
+        self.eos_token_id = geo["ple_eos_token_id"]
+        self.conv_kernel = geo["ple_conv_kernel"]
+
+        width = self.hc * hidden_size
+        gathered = self.n_heads * self.head_dim
+        if gathered != hidden_size:
+            raise ValueError(
+                f"PLE gathers {self.n_heads} heads of {self.head_dim} = {gathered}, which "
+                f"should equal hidden_size {hidden_size}"
+            )
+
+        self.table = GGUFEmbedding(
+            table_rows, self.head_dim, quant_type=quant_types["table"]
+        )
+        self.key = GGUFLinear(gathered, width, quant_type=quant_types["key"])
+        self.value = GGUFLinear(gathered, hidden_size, quant_type=quant_types["value"])
+        self.norm_key = torch.empty(width)
+        self.norm_query = torch.empty(width)
+        self.norm_conv = torch.empty(width)
+        self.conv1d = torch.empty(self.conv_kernel, width)
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        rows: torch.Tensor,
+        *,
+        history: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``state`` [T, hc, D]; ``rows`` [T, n_heads] int32 row indices from the hash."""
+        T = state.shape[0]
+        emb = self.table.forward(rows.reshape(-1)).reshape(T, self.n_heads * self.head_dim)
+
+        key = grouped_rms_norm(
+            self.key.forward(emb).reshape(T, self.hc, self.hidden_size),
+            self.norm_key, self.eps, self.hc,
+        ).reshape(T, self.hc, self.hidden_size)
+        query = grouped_rms_norm(state, self.norm_query, self.eps, self.hc).reshape(
+            T, self.hc, self.hidden_size
+        )
+
+        # Per-stream dot product, scaled, then a signed square root before the sigmoid.
+        scores = (key * query).sum(dim=-1) / math.sqrt(self.hidden_size)   # [T, hc]
+        gate = signed_sqrt_gate(scores)
+
+        value = self.value.forward(emb)                                    # [T, D]
+        gated = value.unsqueeze(1) * gate.unsqueeze(-1)                    # [T, hc, D]
+
+        normalized = grouped_rms_norm(gated, self.norm_conv, self.eps, self.hc)  # [T, hc*D]
+        conv_out = dilated_causal_conv(
+            normalized, self.conv1d, history=history, dilation=self.ngram_size
+        )
+        conv_out = F.silu(conv_out).reshape(T, self.hc, self.hidden_size)
+        return state + gated + conv_out

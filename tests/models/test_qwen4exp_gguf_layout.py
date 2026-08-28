@@ -210,11 +210,17 @@ def test_ple_head_tables_are_consistent():
         check_ple_tables(geo, table_rows=sum(sizes) - 1)
 
 
-def test_arch_is_not_registered_yet():
-    """No model class exists, so claiming support would turn a clear refusal into a crash."""
+def test_arch_is_registered_and_resolves_to_a_real_class():
+    """A registry entry pointing at a missing class turns a clear refusal into an import
+    error, so the mapping is only useful if it actually resolves."""
     from freetoken.models.gguf.config import GGUF_ARCH_TO_REGISTRY
+    from freetoken.models.register import _MODEL_REGISTRY, _load_attr
 
-    assert "qwen4exp" not in GGUF_ARCH_TO_REGISTRY
+    key = GGUF_ARCH_TO_REGISTRY["qwen4exp"]
+    spec = _MODEL_REGISTRY[key]
+    assert _load_attr(spec.module, spec.model_cls) is not None
+    assert _load_attr(spec.module, spec.parse_config) is not None
+    assert _load_attr(spec.module, spec.iter_weights) is not None
 
 
 def test_derived_widths_match_the_real_tensor_shapes(real_table):

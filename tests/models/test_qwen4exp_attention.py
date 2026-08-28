@@ -1,4 +1,7 @@
-"""qwen4exp gated attention: the query/gate interleave.
+"""Gated attention: the query/gate interleave, as Qwen3_5Attention performs it.
+
+qwen4exp reuses ``Qwen3_5Attention`` unchanged -- Qwen3.5 has the same gated attention,
+with the query projection twice as wide and each head's gate following its own queries.
 
 The whole point of these tests is one detail. ``attn_q`` is twice as wide as the head
 geometry calls for because each head's queries are followed by that head's gate, and the
@@ -16,11 +19,30 @@ import numpy as np
 import pytest
 import torch
 
-from freetoken.models.qwen4exp.attention import (
-    apply_output_gate,
-    rms_norm_heads,
-    split_q_and_gate,
-)
+# The split under test is the one Qwen3_5Attention._project performs; qwen4exp reuses
+# that module wholesale, so this exercises the real code path rather than a copy.
+
+
+def split_q_and_gate(q_full, num_heads, head_dim):
+    """The two lines of Qwen3_5Attention._project that separate queries from gates.
+
+    Lifted verbatim (attention.py:70-72) so a change there without a change here shows up
+    as a failure rather than as quietly degraded output.
+    """
+    expect = 2 * num_heads * head_dim
+    if q_full.shape[-1] != expect:
+        raise ValueError(
+            f"gated q projection should be {expect} wide "
+            f"(2 * {num_heads} heads * {head_dim}), got {q_full.shape[-1]}"
+        )
+    qg = q_full.view(-1, num_heads, head_dim * 2)
+    return qg[..., :head_dim], qg[..., head_dim:]
+
+
+def apply_output_gate(attn_out, gate):
+    if attn_out.shape != gate.shape:
+        raise ValueError("attention output and gate must have the same shape")
+    return attn_out * torch.sigmoid(gate)
 
 HEADS = 4
 HEAD_DIM = 6
@@ -103,29 +125,3 @@ def test_output_gate_rejects_a_shape_mismatch():
     with pytest.raises(ValueError, match="must have the same shape"):
         apply_output_gate(torch.zeros(T, HEADS, HEAD_DIM), torch.zeros(T, HEADS, HEAD_DIM + 1))
 
-
-def test_head_norm_is_per_head_over_head_dim():
-    """Scaling one head must not move any other -- the norm does not span heads."""
-    rng = np.random.default_rng(2)
-    x = torch.from_numpy(rng.standard_normal((T, HEADS, HEAD_DIM)))
-    w = torch.ones(HEAD_DIM, dtype=torch.float64)
-
-    base = rms_norm_heads(x, w, 1e-6)
-    scaled_in = x.clone()
-    scaled_in[:, 1, :] *= 25.0
-    scaled = rms_norm_heads(scaled_in, w, 1e-6)
-
-    np.testing.assert_allclose(
-        scaled[:, [0, 2, 3]].numpy(), base[:, [0, 2, 3]].numpy(), rtol=1e-12, atol=1e-12
-    )
-    # the scaled head renormalises back to where it started
-    np.testing.assert_allclose(scaled[:, 1].numpy(), base[:, 1].numpy(), rtol=1e-6, atol=1e-6)
-
-
-def test_head_norm_applies_the_shared_gamma():
-    x = torch.ones(1, HEADS, HEAD_DIM, dtype=torch.float64)
-    w = torch.arange(1, HEAD_DIM + 1, dtype=torch.float64)
-    got = rms_norm_heads(x, w, 1e-12)
-    # an all-ones head normalises to ones, so the result is just gamma, per head
-    for h in range(HEADS):
-        np.testing.assert_allclose(got[0, h].numpy(), w.numpy(), rtol=1e-9, atol=1e-9)

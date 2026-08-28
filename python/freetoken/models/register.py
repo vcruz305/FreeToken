@@ -114,6 +114,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
+    # qwen4exp GGUF (Qwen3.8-Flash-Next): its own package, since the residual path is
+    # hyper-connections rather than pre-norms, but the mixers and FFN come from qwen35moe.
+    "Qwen4ExpGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen4exp",
+        "Qwen4ExpForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     # Dense qwen35 GGUF (Qwen3.8-27B): same package and classes, moe_enabled==False.
     "Qwen35GGUFForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",

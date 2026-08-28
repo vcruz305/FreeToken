@@ -1,7 +1,14 @@
 """qwen4exp -- the architecture behind Qwen3.8-Flash-Next.
 
-Only the GGUF layout layer exists so far: config parsing, the tensor name map, and the
-layer schedule. There is no model class yet, so the arch is deliberately NOT registered in
-``GGUF_ARCH_TO_REGISTRY`` -- a registry entry pointing at a class that does not exist would
-turn "unsupported architecture" into an import error.
+A qwen35moe core -- gated delta net on the linear layers, gated attention on the full
+ones, routed MoE with a gated shared expert -- wrapped in a hyper-connection residual path,
+with n-gram hashed per-layer embeddings on one layer.
+
+Served from GGUF only; the hyper-connection, indexer and PLE geometry is read from the
+checkpoint rather than from a config file.
 """
+
+from .gguf import iter_gguf_weights, parse_gguf_config
+from .model import Qwen4ExpForCausalLM
+
+__all__ = ["Qwen4ExpForCausalLM", "parse_gguf_config", "iter_gguf_weights"]

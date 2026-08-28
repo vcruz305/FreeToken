@@ -26,6 +26,9 @@ GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "qwen35": "Qwen35GGUFForCausalLM",
     "qwen3moe": "Qwen3MoeGGUFForCausalLM",
     "deepseek4": "DeepseekV4GGUFForCausalLM",
+    # Qwen3.8-Flash-Next. A qwen35moe core (GDN + routed MoE) wrapped in
+    # hyper-connections, with n-gram hashed per-layer embeddings on one layer.
+    "qwen4exp": "Qwen4ExpGGUFForCausalLM",
 }
 
 

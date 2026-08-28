@@ -21,6 +21,7 @@ from .reader import gguf_architecture, load_gguf_metadata
 _TOKENIZER_ARCH = {
     "gemma4": "gemma4_text",
     "qwen35moe": "qwen2",
+    "qwen4exp": "qwen2",
     "qwen35": "qwen2",
     "qwen3moe": "qwen2",
     # tokenizer.ggml.model is gpt2 (BPE), pre joyai-llm, 129280 entries. The llama
@@ -38,6 +39,7 @@ _TOKENIZER_ARCH = {
 _STOP_TOKENS: dict[str, tuple[str, ...]] = {
     "gemma4": ("<turn|>", "<eos>"),
     "qwen35moe": ("<|im_end|>", "<|endoftext|>"),
+    "qwen4exp": ("<|im_end|>", "<|endoftext|>"),
     # Dense sibling: same vocab and same chat markers as the MoE variant.
     "qwen35": ("<|im_end|>", "<|endoftext|>"),
     "qwen3moe": ("<|im_end|>", "<|endoftext|>"),

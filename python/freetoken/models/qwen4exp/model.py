@@ -229,6 +229,25 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             "geometry is read from the checkpoint"
         )
         geo = geometry_from_path(config.gguf_model_path)
+
+        # This adapter runs dense attention on the full-attention layers. The checkpoint
+        # was trained with a lightning indexer selecting indexer_top_k keys, so dense is
+        # EXACTLY equivalent while the context stays at or below that budget and diverges
+        # above it -- silently, since attending to more keys neither crashes nor produces
+        # anything obviously wrong. Say so at load rather than let it pass unnoticed.
+        from freetoken.utils import init_logger
+
+        top_k = geo["indexer_top_k"]
+        ctx_len = getattr(config, "max_position_embeddings", None) or geo["context_length"]
+        log = init_logger(__name__)
+        if ctx_len > top_k:
+            log.info_rank0(
+                f"qwen4exp: attention runs dense (no lightning indexer). This is exact up "
+                f"to {top_k} tokens of context; beyond that it attends to every key rather "
+                f"than the top {top_k} the model was trained for, and output will drift "
+                f"from the reference."
+            )
+
         self._hidden_size = config.hidden_size
         self._device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         self.model = Qwen4ExpModel(config, geo)

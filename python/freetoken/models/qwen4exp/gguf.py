@@ -702,7 +702,11 @@ def iter_gguf_weights(
             elif name == "output_hc_up.weight":
                 yield "model.hc_head.up", _dequant_any(t)
             elif name == "per_layer_token_embd.weight":
-                yield "model.ple.table.qweight", t.packed()
+                # 28.8 GB of packed rows (320001536 x 90 B). It is never resident on the
+                # GPU -- a token gathers 16 rows of 160 values, about 1.4 kB -- so it is
+                # deliberately kept out of the state dict and mmapped by the PLE block
+                # instead. Yielding it here would try to move 28.8 GB onto a 22 GB card.
+                continue
             else:
                 raise Qwen4ExpLayoutError(f"qwen4exp GGUF: unrecognised global {name!r}")
             continue

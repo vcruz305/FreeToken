@@ -477,8 +477,18 @@ def bank_bytes_estimate(model_config) -> int | None:
             return None
         from freetoken.models.gguf.dequant import row_bytes
 
-        t_gate_up, t_down = types
-        per = 2 * inter * row_bytes(hidden, t_gate_up) + hidden * row_bytes(inter, t_down)
+        # Types are per-layer, and the pool pads every row to the widest type in its bank
+        # (rounded to 8 when a bank is genuinely mixed), so the estimate has to use that
+        # padded stride or it under-counts a dynamic quant and the residency planner picks
+        # a cache that does not fit.
+        gate_up_types, down_types = types
+        gu = max(row_bytes(hidden, int(t)) for t in gate_up_types)
+        dn = max(row_bytes(inter, int(t)) for t in down_types)
+        if len(set(gate_up_types)) > 1:
+            gu = (gu + 7) // 8 * 8
+        if len(set(down_types)) > 1:
+            dn = (dn + 7) // 8 * 8
+        per = 2 * inter * gu + hidden * dn
         return layers * experts * per
     per_expert = _BANK_BYTES_PER_EXPERT.get(fmt)
     if per_expert is None:

@@ -129,17 +129,27 @@ def dilated_causal_conv(
 ) -> torch.Tensor:
     """Depthwise causal conv, dilated, as a sum of shifted copies.
 
-    ``out[t, c] = sum_k w[k, c] * x[t - (K-1-k)*dilation, c]`` -- note the tap index runs
+    ``out[t, c] = sum_k w[c, k] * x[t - (K-1-k)*dilation, c]`` -- note the tap index runs
     backwards, so tap ``K-1`` is the current position and tap 0 reaches furthest back. Each
     tap is one weight per channel; there is no mixing across channels or across positions
     within a tap.
+
+    ``weight`` is ``[channels, taps]``. ggml stores the kernel fastest-first as
+    ``[taps, channels]`` and the reader hands back the reverse, which is the same
+    convention qwen35moe's ``ssm_conv1d`` follows. Indexing it the other way round is a
+    shape error only when taps == channels, so it is asserted rather than assumed.
 
     ``history`` is the ``(K-1)*dilation`` positions preceding ``x``, or None at the start of
     a sequence, where the reference reads zeros. Passing it explicitly (rather than holding
     state here) is what lets a chunked prefill match a single-shot one.
     """
     T, C = x.shape
-    K = weight.shape[0]
+    if weight.shape[0] != C:
+        raise ValueError(
+            f"PLE conv weight should be [channels, taps] with {C} channels, got "
+            f"{tuple(weight.shape)}"
+        )
+    K = weight.shape[1]
     hist = (K - 1) * dilation
     if history is None:
         history = x.new_zeros(hist, C)
@@ -152,7 +162,7 @@ def dilated_causal_conv(
     out = None
     for k in range(K):
         start = hist - (K - 1 - k) * dilation
-        term = padded[start : start + T] * weight[k]
+        term = padded[start : start + T] * weight[:, k]
         out = term if out is None else out + term
     return out
 
@@ -191,15 +201,46 @@ class Qwen4ExpPLE(BaseOP):
                 f"should equal hidden_size {hidden_size}"
             )
 
-        self.table = GGUFEmbedding(
-            table_rows, self.head_dim, quant_type=quant_types["table"]
-        )
+        # NOT a module buffer: see the loader. Held as an mmap-backed host tensor and
+        # indexed per token, so the 28.8 GB never has to fit anywhere.
+        self._table_rows = table_rows
+        self._table_type = quant_types["table"]
+        self._table = None  # bound by bind_table()
         self.key = GGUFLinear(gathered, width, quant_type=quant_types["key"])
         self.value = GGUFLinear(gathered, hidden_size, quant_type=quant_types["value"])
         self.norm_key = torch.empty(width)
         self.norm_query = torch.empty(width)
         self.norm_conv = torch.empty(width)
-        self.conv1d = torch.empty(self.conv_kernel, width)
+        # [channels, taps]: the reader reverses ggml's fastest-first dims.
+        self.conv1d = torch.empty(width, self.conv_kernel)
+
+    def bind_table(self, model_path: str) -> None:
+        """Point at the packed PLE table without copying it.
+
+        The reader hands back an mmap-backed tensor, so this costs address space rather
+        than memory and the OS pages in only the rows actually hashed to.
+        """
+        from freetoken.models.gguf.reader import iter_gguf_tensors
+
+        for t in iter_gguf_tensors(model_path):
+            if t.name == "per_layer_token_embd.weight":
+                self._table = t.packed()
+                return
+        raise ValueError("qwen4exp: per_layer_token_embd.weight not found")
+
+    def _gather(self, rows: torch.Tensor, device) -> torch.Tensor:
+        """Gather the hashed rows on the host, then dequantise them on the device.
+
+        Only the gathered bytes cross the bus: 16 rows of 90 packed bytes per token.
+        """
+        from freetoken.kernel.gguf import ggml_dequantize
+
+        assert self._table is not None, "bind_table() must run before the first forward"
+        idx = rows.reshape(-1).to("cpu", torch.int64)
+        packed = self._table.index_select(0, idx).to(device, non_blocking=True)
+        return ggml_dequantize(
+            packed, self._table_type, packed.shape[0], self.head_dim, torch.bfloat16
+        )
 
     def forward(
         self,
@@ -210,7 +251,7 @@ class Qwen4ExpPLE(BaseOP):
     ) -> torch.Tensor:
         """``state`` [T, hc, D]; ``rows`` [T, n_heads] int32 row indices from the hash."""
         T = state.shape[0]
-        emb = self.table.forward(rows.reshape(-1)).reshape(T, self.n_heads * self.head_dim)
+        emb = self._gather(rows, state.device).reshape(T, self.n_heads * self.head_dim)
 
         key = grouped_rms_norm(
             self.key.forward(emb).reshape(T, self.hc, self.hidden_size),

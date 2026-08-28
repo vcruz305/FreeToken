@@ -9,6 +9,20 @@ checkpoint rather than from a config file.
 """
 
 from .gguf import iter_gguf_weights, parse_gguf_config
+from .gguf_experts import (
+    gguf_expert_specs,
+    gguf_expert_types,
+    load_gguf_expert_sources,
+)
 from .model import Qwen4ExpForCausalLM
 
-__all__ = ["Qwen4ExpForCausalLM", "parse_gguf_config", "iter_gguf_weights"]
+__all__ = [
+    "Qwen4ExpForCausalLM",
+    "parse_gguf_config",
+    "iter_gguf_weights",
+    # The offload expert-bank loader resolves these off the package named by the model
+    # spec, not off the submodule, so they have to be re-exported here.
+    "gguf_expert_types",
+    "gguf_expert_specs",
+    "load_gguf_expert_sources",
+]

@@ -213,6 +213,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         from .gguf import convert_qwen4exp_to_gguf
 
         convert_qwen4exp_to_gguf(self, config, model_path=config.gguf_model_path)
+        self.model.ple.bind_table(config.gguf_model_path)
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
